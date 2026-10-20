@@ -7,6 +7,8 @@ from pathlib import Path
 
 from ultralytics import YOLO
 
+ROOT = Path(__file__).resolve().parents[1]
+
 
 def export_yolo_one(weight, output, imgsz):
     output.mkdir(parents=True, exist_ok=True)
@@ -26,10 +28,18 @@ def export_yolo_one(weight, output, imgsz):
 
 def copy_nano_model(output, source):
     output.mkdir(parents=True, exist_ok=True)
-    param = source / "cotton_tier_nano.ncnn.param"
-    binary = source / "cotton_tier_nano.ncnn.bin"
-    if not param.is_file() or not binary.is_file():
-        raise FileNotFoundError(f"缺少已有 Nano NCNN 文件: {source}")
+    names = ("cotton_tier_nano.ncnn", "convnext_nano.ncnn",
+             "convnext_nano", "model.ncnn")
+    param = binary = None
+    for stem in names:
+        candidate = source / f"{stem}.param"
+        if candidate.is_file():
+            param = candidate
+            binary = source / f"{stem}.bin"
+            break
+    if param is None or binary is None or not binary.is_file():
+        raise FileNotFoundError(
+            f"缺少 Nano NCNN 文件: {source}，先运行 export_nano_ncnn.py")
     shutil.copy2(param, output / "model.ncnn.param")
     shutil.copy2(binary, output / "model.ncnn.bin")
     (output / "labels.json").write_text(
@@ -41,13 +51,13 @@ def copy_nano_model(output, source):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cotton-model", type=Path, default=Path("student_kd/mjc_convnext_nano_i384/best_test.pt"))
-    ap.add_argument("--fiber-model", type=Path, default=Path("deliver/fiber5_yolov8n_cls_288.pt"))
-    ap.add_argument("--out", type=Path, default=Path("rpi_models"))
+    ap.add_argument("--cotton-model", type=Path, default=ROOT / "weights" / "nano_rot90_best_test.pt")
+    ap.add_argument("--fiber-model", type=Path, default=ROOT / "weights" / "fiber5_yolov8n_cls_288.pt")
+    ap.add_argument("--out", type=Path, default=ROOT / "build_rpi_models")
     ap.add_argument("--imgsz", type=int, default=224)
     ap.add_argument("--cotton-imgsz", type=int, default=384)
     ap.add_argument("--fiber-imgsz", type=int, default=288)
-    ap.add_argument("--cotton-nano-source", type=Path, default=Path("nano_ncnn"))
+    ap.add_argument("--cotton-nano-source", type=Path, default=ROOT / "build_nano_ncnn")
     args = ap.parse_args()
     for weight in (args.cotton_model, args.fiber_model):
         if not weight.exists():

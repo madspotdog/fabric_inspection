@@ -371,8 +371,11 @@ ROI           中心 660x660
 
 | 模型 | 单图 | 整布表决 |
 |---|---:|---:|
-| 棉含量 Nano | 67.50% | 75.00% |
+| 棉含量 Nano（部署单帧，无 TTA） | 67.50% | 75.00% |
+| 棉含量 Nano（评估用四向 TTA） | 73.75% | 75.00% |
 | 纯面料 Fiber5 | 100% | 100% |
+
+`validate_dual.py` 默认使用 `--cotton-imgsz 384`。曾误用 224 评估，结果会掉到约 46%，这是输入尺寸不匹配，不是模型退化。
 
 分级召回（棉含量）：
 
@@ -401,6 +404,17 @@ packages/32bit/   树莓派 32 位包
 scripts/          数据构建、训练、验证、导出
 weights/          最终 PyTorch 权重（本地，默认不入库）
 ```
+
+仓库包含推理、训练和导出代码，以及两个 NCNN 模型。以下资产**不包含**：
+
+- 原始数据集（`CottonFabricImageBD`、`mianliao_5`、`mianliao_zijian`、`dual_data`）
+- PyTorch 权重（`weights/*.pt`，被 `.gitignore` 排除）
+- KD 教师权重 `convnext_3tiers_3090_best.pth`（旧实验产物，已清理）
+
+因此在新机器上：
+
+- 只做部署：直接使用 `packages/`，无需数据集和 PyTorch。
+- 重新训练：需要有数据集；教师权重缺失时，`train_kd_3tier.py` 会自动退化为普通交叉熵训练。
 
 ### 7.2 模型文件
 
@@ -440,31 +454,34 @@ chmod +x setup_pi.sh run_camera.sh
 ### 7.5 复现训练
 
 ```bash
-python scripts/build_dual_datasets.py --root <数据根目录> --out dual_data
+python scripts/build_dual_datasets.py --root <数据根目录> --out <数据根目录>/dual_data
 
-# 棉含量（需要教师权重和初始化权重）
+# 棉含量：教师权重可选；缺失时自动只用 CE
 python scripts/train_kd_3tier.py --student convnext_nano.in12k_ft_in1k \
   --imgsz 384 --epochs 6 --batch 16 --lr 3e-5 \
-  --data dual_data/cotton_tier --testdir dual_data/cotton_tier/blind \
-  --name nano_rot90 --init <旧Nano权重> --workers 0
+  --data <数据根目录>/dual_data/cotton_tier \
+  --testdir <数据根目录>/dual_data/cotton_tier/blind \
+  --name nano_round2 --init weights/nano_rot90_best_test.pt \
+  --teacher <教师权重，可选> --workers 0
 
 # 纯面料
-python scripts/train_dual_yolo.py --data dual_data \
-  --project dual_runs_rot90 --fiber-imgsz 288 --epochs 50 --batch 32 \
-  --skip-cotton --fiber-model <Fiber5权重> \
-  --fiber-data dual_data/pure_fiber6 --fiber-name pure_fiber6_rot90
+python scripts/train_dual_yolo.py --data <数据根目录>/dual_data \
+  --project training_runs_yolo --fiber-imgsz 288 --epochs 50 --batch 32 \
+  --skip-cotton --fiber-model weights/fiber5_yolov8n_cls_288.pt \
+  --fiber-data <数据根目录>/dual_data/pure_fiber6 --fiber-name pure_fiber6_round2
 
 # 固定盲测对比
-python scripts/validate_dual.py --data dual_data \
-  --cotton-model <Nano权重> --fiber-model <Fiber权重> \
+python scripts/validate_dual.py --data <数据根目录>/dual_data \
+  --cotton-model weights/nano_rot90_best_test.pt \
+  --fiber-model weights/fiber5_yolov8n_cls_288.pt \
   --cotton-imgsz 384 --fiber-imgsz 288
 ```
 
 ### 7.6 导出 NCNN
 
 ```bash
-python scripts/export_nano_ncnn.py     # Nano -> NCNN
-python scripts/export_dual_ncnn.py     # Fiber5 -> NCNN
+python scripts/export_nano_ncnn.py     # Nano -> build_nano_ncnn/
+python scripts/export_dual_ncnn.py     # Fiber5 + Nano -> build_rpi_models/
 ```
 
 导出后必须用包内 `--check` 做一次真实前向，确认 `in0/out0` 与类别顺序。

@@ -4,3 +4,7 @@ __pycache__/
 .venv/
 weights/*.pt
 archives/*.zip
+training_runs/
+training_runs_yolo/
+build_nano_ncnn/
+build_rpi_models/

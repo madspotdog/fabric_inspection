@@ -208,8 +208,9 @@ def report(name, counts):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--root", default=".")
-    ap.add_argument("--out", default="dual_data")
+    ap.add_argument("--root", default=str(Path(__file__).resolve().parents[1].parent),
+                    help="数据根目录，需包含 CottonFabricImageBD / mianliao_5 / mianliao_zijian")
+    ap.add_argument("--out", default=str(Path(__file__).resolve().parents[1].parent / "dual_data"))
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
     root, out = Path(args.root).resolve(), Path(args.out).resolve()

@@ -34,8 +34,8 @@ def train_one(name, data, model, args, **kwargs):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", type=Path, default=Path("dual_data"))
-    ap.add_argument("--project", type=Path, default=Path("dual_runs"))
+    ap.add_argument("--data", type=Path, default=Path(__file__).resolve().parents[1].parent / "dual_data")
+    ap.add_argument("--project", type=Path, default=Path(__file__).resolve().parents[1] / "training_runs_yolo")
     ap.add_argument("--model", default="yolov8n-cls.pt")
     ap.add_argument("--imgsz", type=int, default=224)
     ap.add_argument("--cotton-imgsz", type=int, default=None)

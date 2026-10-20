@@ -3,8 +3,11 @@
 import argparse
 from collections import Counter, defaultdict
 from pathlib import Path
+
 import numpy as np
 from ultralytics import YOLO
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def cotton_business(name):
@@ -92,11 +95,11 @@ def evaluate_timm(model_path, data, imgsz, business, tta=True):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", type=Path, default=Path("dual_data"))
-    ap.add_argument("--cotton-model", type=Path, default=Path("dual_runs/cotton_tier/weights/best.pt"))
-    ap.add_argument("--fiber-model", type=Path, default=Path("deliver/fiber5_yolov8n_cls_288.pt"))
+    ap.add_argument("--data", type=Path, default=ROOT.parent / "dual_data")
+    ap.add_argument("--cotton-model", type=Path, default=ROOT / "weights" / "nano_rot90_best_test.pt")
+    ap.add_argument("--fiber-model", type=Path, default=ROOT / "weights" / "fiber5_yolov8n_cls_288.pt")
     ap.add_argument("--imgsz", type=int, default=None, help="同时覆盖两个输入尺寸")
-    ap.add_argument("--cotton-imgsz", type=int, default=224)
+    ap.add_argument("--cotton-imgsz", type=int, default=384)
     ap.add_argument("--fiber-imgsz", type=int, default=288)
     args = ap.parse_args()
     if args.imgsz is not None:
@@ -109,7 +112,9 @@ def main():
         fiber_data = args.data / "pure_fiber"
     for title, model_path, data, business, imgsz in (("棉含量", args.cotton_model, args.data / "cotton_tier", cotton_business, args.cotton_imgsz),
                                                       ("纯面料", args.fiber_model, fiber_data, fiber_business, args.fiber_imgsz)):
-        if title == "棉含量" and "convnext_nano" in str(model_path).lower() or title == "棉含量" and "mjc_convnext_nano" in str(model_path).lower():
+        name = str(model_path).lower()
+        is_timm = title == "棉含量" and any(tag in name for tag in ("nano", "rot90", "convnext"))
+        if is_timm:
             result = evaluate_timm(model_path, data, imgsz, business, tta=True)
         else:
             result = evaluate(model_path, data, imgsz, business)
