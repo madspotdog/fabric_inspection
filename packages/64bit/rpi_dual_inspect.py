@@ -35,8 +35,8 @@ def cotton_business(name):
 
 
 def fiber_business(name):
-    return {"棉": "纯棉", "纯棉": "纯棉", "羊毛": "纯羊毛", "纯羊毛": "纯羊毛",
-            "涤纶": "纯涤纶", "纯涤纶": "纯涤纶", "丝": "其他", "亚麻": "其他",
+    return {"棉": "棉", "纯棉": "棉", "羊毛": "羊毛", "纯羊毛": "羊毛",
+            "涤纶": "涤纶", "纯涤纶": "涤纶", "丝": "其他", "亚麻": "其他",
             "其他": "其他"}.get(name, "其他")
 
 
@@ -127,7 +127,7 @@ def inspect(cotton, fiber, image, args):
             ct = "待定"
     if fc < args.fiber_threshold:
         ft = "其他"
-    accepted = cotton_entered and ((ct == "低棉" and ft == "其他") or (ct == "高棉" and ft == "纯棉"))
+    accepted = cotton_entered and ((ct == "低棉" and ft == "其他") or (ct == "高棉" and ft == "棉"))
     return {
         "cotton_tier": ct, "cotton_raw": ct_raw, "cotton_conf": round(cc, 5),
         "cotton_probs": [round(float(x), 5) for x in cp],
@@ -158,57 +158,149 @@ def load_font(size):
 
 
 def draw_panel(image, result):
-    """Draw a legible customer-facing result panel without changing inference."""
+    """只显示与指示灯一致的"判定档位"。"""
     import cv2
     from PIL import Image, ImageDraw
 
     h, w = image.shape[:2]
-    panel_w = min(500, max(400, w // 3))
+    panel_w = min(520, max(420, w // 3))
     panel_x = max(0, w - panel_w)
     cv2.rectangle(image, (panel_x, 0), (w, h), (12, 18, 26), -1)
     pil = Image.fromarray(image[:, :, ::-1])
     draw = ImageDraw.Draw(pil)
     title = load_font(30)
-    label = load_font(21)
-    value = load_font(36)
-    small = load_font(18)
-    decision_font = load_font(46)
+    label = load_font(24)
+    big = load_font(84)
+    small = load_font(19)
     x = panel_x + 24
-    draw.text((x, 18), "面料智能检测", font=title, fill=(255, 255, 255))
-    draw.line((x, 68, w - 24, 68), fill=(105, 125, 145), width=2)
 
-    cotton = result["cotton_tier"]
-    fiber = result["pure_fiber"]
-    decision = result["cross_check"]
-    decision_color = (80, 215, 125) if decision == "通过" else (255, 185, 65)
-    rows = (
-        ("棉含量档位", cotton, f"置信度 {result['cotton_conf']:.1%}", (90, 190, 255)),
-        ("纯面料判断", fiber, f"置信度 {result['pure_fiber_conf']:.1%}", (190, 155, 255)),
-    )
-    y = 102
-    for name, val, conf, color in rows:
-        draw.text((x, y), name, font=label, fill=(220, 232, 242))
-        draw.text((x, y + 31), val, font=value, fill=(255, 255, 255))
-        draw.text((x, y + 78), conf, font=small, fill=(225, 235, 242))
-        y += 134
-    gate_text = f"棉门控 P(棉) {result['cotton_gate_prob']:.1%}"
-    gate_state = "已进入棉含量识别" if result["cotton_entered"] else "未进入棉含量识别"
-    draw.text((x, y - 12), gate_text, font=small, fill=(255, 225, 90))
-    draw.text((x, y + 14), gate_state, font=small, fill=(225, 235, 242))
-    y += 48
-    draw.line((x, y - 20, w - 24, y - 20), fill=(105, 125, 145), width=2)
-    draw.text((x, y + 2), "最终判定", font=label, fill=(255, 255, 255))
-    box_top = y + 34
-    box_bottom = box_top + 76
-    box_color = (28, 145, 75) if decision == "通过" else (190, 105, 20)
-    draw.rounded_rectangle((x, box_top, w - 24, box_bottom), radius=10,
-                           fill=box_color, outline=(255, 255, 255), width=2)
-    draw.text((x + 18, box_top + 12), decision, font=decision_font, fill=(255, 255, 255))
-    time_top = box_bottom + 18
-    draw.text((x, time_top), "本次推理时间", font=label, fill=(220, 232, 242))
-    draw.text((x, time_top + 27), f"{result['elapsed_ms']:.0f} ms", font=value, fill=(255, 225, 90))
+    level = result_level(result)
+    meaning = {1: "其他", 2: "羊毛 / 涤纶 / 低棉", 3: "棉"}.get(level, "其他")
+
+    draw.text((x, 20), "面料智能检测", font=title, fill=(255, 255, 255))
+    draw.line((x, 72, w - 24, 72), fill=(105, 125, 145), width=2)
+    draw.text((x, 130), "判定档位", font=label, fill=(220, 232, 242))
+    draw.text((x, 170), f"第 {level} 档", font=big, fill=(0, 220, 0))
+    draw.text((x, 300), meaning, font=label, fill=(190, 205, 215))
+    draw.line((x, h - 152, w - 24, h - 152), fill=(105, 125, 145), width=2)
+    draw.text((x, h - 130), "本次推理时间", font=label, fill=(220, 232, 242))
+    draw.text((x, h - 94), f"{result['elapsed_ms']:.0f} ms", font=load_font(40), fill=(255, 225, 90))
     draw.text((x, h - 42), "SPACE 识别    Q / ESC 退出", font=small, fill=(205, 220, 232))
     return np.asarray(pil)[:, :, ::-1].copy()
+
+
+class LedBar:
+    """三颗 LED 指示灯（BCM 引脚，PWM 支持缓灭）。没有 GPIO 库或在非树莓派上时自动禁用。"""
+
+    def __init__(self, pins, enabled=True):
+        self.enabled = bool(enabled and pins)
+        self.leds = []
+        self._bri = []
+        self._stop = None
+        self._thread = None
+        if self.enabled:
+            try:
+                from gpiozero import PWMLED
+                self.leds = [PWMLED(int(p)) for p in pins]
+                self._bri = [0.0] * len(self.leds)
+            except Exception as exc:
+                print(f"[LED] 初始化失败(已禁用): {exc}")
+                self.enabled = False
+
+    def _write(self, i, v):
+        v = 0.0 if v < 0 else (1.0 if v > 1 else v)
+        self._bri[i] = v
+        self.leds[i].value = v
+
+    def set_level(self, level):
+        """结果灯：只亮第 level 颗（1→第1颗, 2→第2颗, 3→第3颗），其余全灭。"""
+        if not self.enabled:
+            return
+        for i in range(len(self.leds)):
+            self._write(i, 1.0 if i == (level - 1) else 0.0)
+
+    def all_off(self):
+        if not self.enabled:
+            return
+        for i in range(len(self.leds)):
+            self._write(i, 0.0)
+
+    def start_loop(self):
+        """空闲单点走马灯：点亮一颗 → 保持 → 缓慢熄灭 → 熄灭后下一颗再亮（不重叠）。"""
+        if not self.enabled:
+            return
+        import threading
+        import time
+        self._stop = threading.Event()
+
+        def anim():
+            n = len(self.leds)
+            seq = list(range(n)) + list(range(n - 2, 0, -1))
+            dt = 0.02
+            up, down, hold = 0.10, 0.04, 0.25   # 渐亮/渐灭步长、全亮保持时长
+            while not self._stop.is_set():
+                for cur in seq:
+                    if self._stop.is_set():
+                        return
+                    v = 0.0
+                    while v < 1.0 and not self._stop.is_set():
+                        v = min(1.0, v + up)
+                        self._write(cur, v)
+                        time.sleep(dt)
+                    t0 = time.time()
+                    while (time.time() - t0) < hold and not self._stop.is_set():
+                        time.sleep(dt)
+                    while v > 0.0 and not self._stop.is_set():
+                        v = max(0.0, v - down)
+                        self._write(cur, v)
+                        time.sleep(dt)
+                    self._write(cur, 0.0)
+
+        self._thread = threading.Thread(target=anim, daemon=True)
+        self._thread.start()
+
+    def stop_loop(self):
+        if getattr(self, "_stop", None) is not None:
+            self._stop.set()
+        if getattr(self, "_thread", None) is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+        self._stop = None
+
+    def error(self):
+        if not self.enabled:
+            return
+        self.stop_loop()
+        import time
+        for _ in range(3):
+            for i in range(len(self.leds)):
+                self._write(i, 1.0)
+            time.sleep(0.22)
+            for i in range(len(self.leds)):
+                self._write(i, 0.0)
+            time.sleep(0.22)
+
+
+def result_level(result):
+    """按规则把结果映射成 1/2/3 颗灯。"""
+    ct = result.get("cotton_tier")
+    ft = result.get("pure_fiber")
+    if ct in ("中棉", "高棉"):
+        return 3
+    if ct == "低棉":
+        return 2
+    if ft == "棉":
+        return 3
+    if ft in ("羊毛", "涤纶"):
+        return 2
+    return 1
+
+
+def blur_score(bgr):
+    """拉普拉斯方差，越大越清晰。"""
+    import cv2
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
 
 def main():
@@ -230,6 +322,12 @@ def main():
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
     ap.add_argument("--mjpg", action="store_true", help="请求 USB 相机 MJPG 格式")
+    ap.add_argument("--fullscreen", action="store_true", help="全屏显示窗口")
+    ap.add_argument("--leds", action="store_true", help="用三颗LED(默认BCM17/27/22)显示结果")
+    ap.add_argument("--led-pins", default="17,27,22", help="LED的GPIO(BCM)，逗号分隔，依次对应1~3颗灯")
+    ap.add_argument("--blur-thresh", type=float, default=0.0,
+                    help="拉普拉斯方差低于此值判为模糊->其他(1灯)；0=关闭")
+    ap.add_argument("--button", type=int, default=0, help="拍照按钮的GPIO(BCM)，0=关闭")
     ap.add_argument("--warmup", type=int, default=2)
     ap.add_argument("--cotton-threshold", type=float, default=.46)
     ap.add_argument("--cotton-gate", type=float, default=.20,
@@ -267,29 +365,76 @@ def main():
             print(f"{os.path.basename(path)} -> {inspect(cotton, fiber, image, args)}")
         return
     import cv2
-    cap = cv2.VideoCapture(args.camera)
-    if not cap.isOpened():
-        raise SystemExit(f"打不开摄像头: {args.camera}")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    if args.mjpg:
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    print(f"空格识别，q/ESC退出；camera={args.camera} requested={args.width}x{args.height} mjpg={args.mjpg}")
+    pins = [p.strip() for p in args.led_pins.split(",") if p.strip()]
+    ledbar = LedBar(pins, args.leds)
+    btn = None
+    if args.button:
+        try:
+            from gpiozero import Button
+            btn = Button(args.button, pull_up=True, bounce_time=0.05)
+        except Exception as exc:
+            print(f"[按钮] 初始化失败(已禁用): {exc}")
+            btn = None
+    print(f"空格/按钮拍照，q/ESC退出；camera={args.camera} {args.width}x{args.height} mjpg={args.mjpg} fullscreen={args.fullscreen} leds={args.leds}")
+
+    ledbar.start_loop()          # 开机立即走马灯（空闲提示），不依赖相机是否就绪
+    win = "dual fabric inspect"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
     result = None
-    while True:
-        ok, frame = cap.read()
-        if not ok: break
-        view = frame.copy()
-        cv2.putText(view, "USB microscope", (18, 34), 0, .8, (0, 255, 0), 2)
-        if result:
-            view = draw_panel(view, result)
-        cv2.imshow("dual fabric inspect", view)
-        key = cv2.waitKey(1) & 255
-        if key in (ord("q"), 27): break
-        if key == ord(" "):
-            result = inspect(cotton, fiber, frame, args)
-            print(result)
-    cap.release(); cv2.destroyAllWindows()
+    fs_done = False
+    btn_last = False
+    cap = None
+    try:
+        while True:
+            if cap is None:
+                cap = cv2.VideoCapture(args.camera, cv2.CAP_V4L2)
+                if not cap.isOpened():
+                    cap = None
+                    if (cv2.waitKey(1) & 255) in (ord("q"), 27):
+                        break
+                    time.sleep(1.5)
+                    continue
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+                if args.mjpg:
+                    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+                print("摄像头已就绪")
+            ok, frame = cap.read()
+            if not ok:
+                cap.release(); cap = None
+                continue
+            view = frame.copy()
+            cv2.putText(view, "USB microscope", (18, 34), 0, .8, (0, 255, 0), 2)
+            if result:
+                view = draw_panel(view, result)
+            cv2.imshow(win, view)
+            if args.fullscreen and not fs_done:
+                cv2.setWindowProperty(win, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                fs_done = True
+            key = cv2.waitKey(1) & 255
+            if key in (ord("q"), 27): break
+            trigger = (key == ord(" "))
+            if btn is not None:
+                p = btn.is_pressed
+                if p and not btn_last:
+                    trigger = True
+                btn_last = p
+            if trigger:
+                result = inspect(cotton, fiber, frame, args)
+                print(result)
+                level = result_level(result)
+                ledbar.stop_loop()
+                ledbar.set_level(level)
+                print(f"[灯] 亮 {level} 颗")
+    except Exception as exc:
+        print("[错误]", exc)
+        ledbar.error()
+    finally:
+        if cap is not None:
+            cap.release()
+        cv2.destroyAllWindows()
+        ledbar.stop_loop()
+        ledbar.all_off()
 
 
 if __name__ == "__main__":

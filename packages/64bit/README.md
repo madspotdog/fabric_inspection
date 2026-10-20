@@ -59,3 +59,57 @@ USB 显微镜建议先运行下面的基准，分别测试 2/3/4 线程和 FP16�
 棉含量门控可通过 `--cotton-gate` 调整。结果中会显示棉概率和是否进入棉含量识别。
 
 Pi 4B 64 位部署建议：主动散热、稳定 5V/3A 电源、USB 相机请求 `1280x720 MJPG`。实际格式和帧率以程序打印的相机协商结果为准。
+
+## 指示灯（三颗 LED）
+
+生产接线（BCM 编号）：
+
+- LED：`GPIO6`、`GPIO17`、`GPIO22`，依次对应第 1/2/3 颗灯（PWM 缓灭，GPIO6 属 0~8 上拉组，略暗属正常）；
+- 拍照按钮：`GPIO24`（内部上拉）。
+
+灯的显示逻辑：
+
+- 待机/空闲：三颗灯单点走马灯（亮一颗 → 保持 → 缓慢熄灭 → 下一颗）；
+- 检测结果：只亮一颗 —— 第 1/2/3 颗分别对应第 1/2/3 档；
+- 异常：三颗同时快闪 3 次。
+
+运行参数：
+
+```bash
+.venv/bin/python rpi_dual_inspect.py --camera 0 --threads 2 --width 1280 --height 720 --mjpg \
+  --fullscreen --leds --led-pins 6,17,22 --button 24 \
+  --cotton-gate 0.20 --cotton-threshold 0.46 --fiber-threshold 0.50
+```
+
+单独验证灯：
+
+```bash
+.venv/bin/python led_test.py --pins 6,17,22
+```
+
+## 开机自启
+
+图形桌面（Labwc/Wayland）下用 XDG autostart：
+
+- `/home/<user>/.config/autostart/rpi_dual_v3.desktop` 指向 `autostart.sh`；
+- `autostart.sh` 负责 `sleep` 等相机/USB 就绪、启动程序、失败重试，并写 `autostart.log`；
+- 走马灯在程序启动后立即开始，相机未就绪会自动重试，不退出。
+
+`autostart.sh` 示例：
+
+```bash
+#!/usr/bin/env bash
+cd "$(dirname "$0")"
+sleep 12
+LOG="$(pwd)/autostart.log"
+while true; do
+  ./.venv/bin/python rpi_dual_inspect.py --camera 0 --threads 2 --width 1280 --height 720 --mjpg \
+    --fullscreen --leds --led-pins 6,17,22 --button 24 \
+    --cotton-gate 0.20 --cotton-threshold 0.46 --fiber-threshold 0.50 >>"$LOG" 2>&1
+  echo "[$(date)] 程序退出，5 秒后重启" >>"$LOG"
+  sleep 5
+done
+```
+
+界面改造后，右侧面板只显示「判定档位 第 N 档」，与指示灯保持一致；完整概率仍打印到终端日志，便于后续标定。
+
