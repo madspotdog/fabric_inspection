@@ -1,5 +1,5 @@
 {
-  "software": "面料显微图像双模型智能识别软件",
+  "software": "纯面料及混纺双模型智能识别软件",
   "version": "1.0.0",
   "models": {
     "cotton_tier": {
