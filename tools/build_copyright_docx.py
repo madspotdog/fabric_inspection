@@ -19,7 +19,7 @@ from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 
 ROOT = Path(__file__).resolve().parents[1]
-NAME = "面料显微图像双模型智能识别软件"
+NAME = "纯面料及混纺双模型智能识别软件"
 VERSION = "V1.0.0"
 LINES_PER_PAGE = 50
 MANUAL_PARTS = ("USER_MANUAL.md", "SOFTWARE_DESIGN.md", "ALGORITHM.md", "TEST_REPORT.md")
