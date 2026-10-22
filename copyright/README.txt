@@ -1,9 +1,9 @@
 软著源程序导出说明
-源文件数量: 26
-有效行数: 2238
+源文件数量: 27
+有效行数: 2449
 每页行数: 50
-总页数: 45
-导出页数: 45（不足 60 页时导出全部）
+总页数: 49
+导出页数: 49（不足 60 页时导出全部）
 
 source_full.txt 为全部源码；source_60pages.txt 为按申报规则截取的前后页。
 提交前请删除本地路径、密钥、个人邮箱等敏感信息。
@@ -26,6 +26,7 @@ source_full.txt 为全部源码；source_60pages.txt 为按申报规则截取的
 - scripts/validate_dual.py
 - packages/64bit/rpi_dual_inspect.py
 - packages/64bit/benchmark_dual.py
+- packages/64bit/led_test.py
 - packages/32bit/rpi_dual_inspect.py
 - packages/32bit/benchmark_dual.py
 - tests/test_config.py

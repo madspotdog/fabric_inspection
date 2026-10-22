@@ -20,6 +20,7 @@ DEFAULT_FILES = (
     "scripts/*.py",
     "packages/64bit/rpi_dual_inspect.py",
     "packages/64bit/benchmark_dual.py",
+    "packages/64bit/led_test.py",
     "packages/32bit/rpi_dual_inspect.py",
     "packages/32bit/benchmark_dual.py",
     "tests/*.py",
