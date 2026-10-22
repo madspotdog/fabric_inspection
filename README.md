@@ -56,14 +56,35 @@ USB 显微镜
 ## 文档
 
 - `docs/TRAINING_AND_DEPLOYMENT.md`：完整训练过程、试错记录、超参数、数据预处理与开发板迁移说明。
+- `docs/ALGORITHM.md`：算法公式、门控、档位判定、交叉校验真值表、指标。
+- `docs/SOFTWARE_DESIGN.md`：软件设计说明书，适合软著和交付。
+- `docs/USER_MANUAL.md`：安装、操作、界面、参数、故障处理。
+- `docs/TEST_REPORT.md`：单元测试、模型校验、盲测结果和已知限制。
+- `docs/COPYRIGHT_GUIDE.md`：软著申报材料清单与源码排版方法。
+- `THIRD_PARTY.md`：第三方许可证说明（含 YOLOv8 AGPL 风险）。
+
+## 软著材料
+
+```bash
+python tools/export_copyright_source.py   # 生成 50 行/页的申报源码
+python tools/verify_models.py             # 校验模型哈希、in0/out0、类别数
+python -m pytest                          # 33 个单元测试
+```
+
+`copyright/` 下会生成 `source_full.txt`、`source_60pages.txt` 和页数说明。
 
 ## 目录
 
 ```text
 packages/64bit/     64 位树莓派部署包
 packages/32bit/     32 位树莓派部署包
+src/                与硬件无关的核心算法参考实现
 scripts/            数据构建、训练、验证、导出脚本
-docs/               算法与验收说明
+tests/              单元测试
+tools/              软著源码导出、模型校验
+configs/            64/32 位阈值配置
+models/             NCNN 模型清单与 SHA256
+docs/               算法、设计、手册、测试、软著指南
 weights/            最终 PyTorch 权重（本地保留，默认不入库）
 archives/           两个部署 zip（本地保留，默认不入库）
 ```

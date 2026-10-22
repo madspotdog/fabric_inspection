@@ -1,0 +1,11 @@
+{
+  "cotton_gate": 0.20,
+  "cotton_confidence": 0.46,
+  "cotton_margin": 0.0,
+  "fiber_confidence": 0.50,
+  "focus": 75.0,
+  "focus_required": false,
+  "cotton_input": 384,
+  "fiber_input": 288,
+  "roi": 660
+}

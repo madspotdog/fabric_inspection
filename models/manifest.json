@@ -1,0 +1,34 @@
+{
+  "software": "面料显微图像双模型智能识别软件",
+  "version": "1.0.0",
+  "models": {
+    "cotton_tier": {
+      "role": "棉含量三分类",
+      "architecture": "ConvNeXt-Nano (convnext_nano.in12k_ft_in1k)",
+      "input_size": 384,
+      "normalization": "ImageNet mean/std",
+      "labels": ["Tier0_Low", "Tier1_Mid", "Tier2_High"],
+      "business_labels": ["低棉", "中棉", "高棉"],
+      "param": "packages/64bit/models/cotton_tier/model.ncnn.param",
+      "bin": "packages/64bit/models/cotton_tier/model.ncnn.bin",
+      "param_sha256": "35e219c148e994884d1f0bb773bc48cd37bcc3e0c1258a04e083dab991a8ac99",
+      "bin_sha256": "c8f219fbd5a5129f8547c31fabd401f0d592d1219f809a9dbac04e9981775405",
+      "bin_bytes": 29994440,
+      "source_weight": "weights/nano_rot90_best_test.pt"
+    },
+    "pure_fiber": {
+      "role": "纯面料六分类",
+      "architecture": "YOLOv8n-cls",
+      "input_size": 288,
+      "normalization": "0-1 RGB",
+      "labels": ["丝", "亚麻", "其他", "棉", "涤纶", "羊毛"],
+      "business_labels": ["其他", "其他", "其他", "纯棉", "纯涤纶", "纯羊毛"],
+      "param": "packages/64bit/models/pure_fiber/model.ncnn.param",
+      "bin": "packages/64bit/models/pure_fiber/model.ncnn.bin",
+      "param_sha256": "2e4dd7b88663b91c4ff22fcc62b59ac4d8bc3a03568c1fe5fb9dcead072c92f0",
+      "bin_sha256": "037eb5de9367b5c655f94d0847027e9922cdbbe4397b8dee409ae79f78b61faf",
+      "bin_bytes": 5770372,
+      "source_weight": "weights/fiber5_yolov8n_cls_288.pt"
+    }
+  }
+}

@@ -1,0 +1,2328 @@
+// ---------- 第 1 页 ----------
+// ===== src/fabric_inspection/__init__.py =====
+# -*- coding: utf-8 -*-
+"""面料显微图像双模型识别参考实现。
+
+该包只包含与硬件无关的核心算法，便于单元测试和跨平台复用：
+- labels: 类别映射
+- preprocess: 中心 ROI、缩放、归一化、清晰度
+- decision: 棉含量门控、三档判定、交叉校验
+- metrics: 混淆矩阵、召回率、整布表决
+- schema: 统一结果结构
+"""
+
+__version__ = "1.0.0"
+
+// ===== src/fabric_inspection/config.py =====
+# -*- coding: utf-8 -*-
+"""配置加载与校验。"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from .decision import Thresholds
+
+DEFAULTS = {
+    "cotton_gate": 0.20,
+    "cotton_confidence": 0.46,
+    "cotton_margin": 0.0,
+    "fiber_confidence": 0.50,
+    "focus": 75.0,
+    "focus_required": False,
+    "cotton_input": 384,
+    "fiber_input": 288,
+    "roi": 660,
+}
+
+def load_thresholds(path: str | Path | None = None) -> Thresholds:
+    """从 JSON 读取阈值；字段缺失时使用默认值。"""
+    data = dict(DEFAULTS)
+    if path is not None:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        unknown = set(payload) - set(DEFAULTS)
+        if unknown:
+            raise ValueError(f"未知配置项: {sorted(unknown)}")
+        data.update(payload)
+    return Thresholds(
+        cotton_gate=float(data["cotton_gate"]),
+        cotton_confidence=float(data["cotton_confidence"]),
+        cotton_margin=float(data["cotton_margin"]),
+        fiber_confidence=float(data["fiber_confidence"]),
+
+// ---------- 第 2 页 ----------
+        focus=float(data["focus"]),
+        focus_required=bool(data["focus_required"]),
+    )
+
+// ===== src/fabric_inspection/decision.py =====
+# -*- coding: utf-8 -*-
+"""级联判定：棉概率门控、三档判定与交叉校验。"""
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict, field
+from typing import Sequence
+
+import numpy as np
+
+from .labels import COTTON_TIERS, cotton_business, cotton_index, fiber_business
+
+def softmax(logits: Sequence[float]) -> np.ndarray:
+    """数值稳定的 softmax。已经是概率向量时原样归一化。"""
+    values = np.asarray(logits, dtype=np.float32).reshape(-1)
+    if values.size == 0:
+        raise ValueError("logits 不能为空")
+    if np.all(values >= -1e-5) and abs(float(values.sum()) - 1.0) < 1e-3:
+        return values / max(float(values.sum()), 1e-12)
+    values = values - float(values.max())
+    exp = np.exp(values)
+    return exp / max(float(exp.sum()), 1e-12)
+
+@dataclass
+class Thresholds:
+    """所有阈值集中管理，便于现场标定。"""
+
+    cotton_gate: float = 0.20
+    cotton_confidence: float = 0.46
+    cotton_margin: float = 0.0
+    fiber_confidence: float = 0.50
+    focus: float = 75.0
+    focus_required: bool = False
+
+@dataclass
+class InspectionResult:
+    cotton_tier: str
+    cotton_raw: str
+    cotton_confidence: float
+    cotton_margin: float
+    cotton_probabilities: list[float]
+    cotton_gate_probability: float
+    cotton_entered: bool
+    pure_fiber: str
+    fiber_raw: str
+    fiber_confidence: float
+
+// ---------- 第 3 页 ----------
+    fiber_probabilities: list[float]
+    cross_check: str
+    focus: float
+    thresholds: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+def decide(cotton_probs, fiber_probs, fiber_names, thresholds: Thresholds,
+           focus: float | None = None) -> InspectionResult:
+    """执行一次完整判定。
+
+    cotton_probs 为 None 表示未运行棉含量模型；函数会根据 P(棉) 自行决定
+    是否需要它。返回结构可直接序列化为 JSON。
+    """
+    fiber_p = softmax(fiber_probs)
+    if len(fiber_p) != len(fiber_names):
+        raise ValueError("fiber_probs 长度与 fiber_names 不一致")
+
+    index = cotton_index(fiber_names)
+    gate_probability = float(fiber_p[index]) if index is not None else 0.0
+    entered = gate_probability >= thresholds.cotton_gate
+
+    fiber_top = int(np.argmax(fiber_p))
+    fiber_raw = fiber_names[fiber_top]
+    fiber_conf = float(fiber_p[fiber_top])
+    pure_fiber = fiber_business(fiber_raw)
+    if fiber_conf < thresholds.fiber_confidence:
+        pure_fiber = "其他"
+
+    if not entered:
+        cotton_tier = "不适用"
+        cotton_raw = "未运行"
+        cotton_conf = 0.0
+        cotton_margin = 0.0
+        cotton_p = [0.0, 0.0, 0.0]
+        cotton_valid = False
+    else:
+        if cotton_probs is None:
+            raise ValueError("P(棉) 达到门限，但未提供 cotton_probs")
+        cotton_p = softmax(cotton_probs)
+        if len(cotton_p) != len(COTTON_TIERS):
+            raise ValueError("cotton_probs 必须是三分类输出")
+        order = np.sort(cotton_p)
+        cotton_margin = float(order[-1] - order[-2])
+        top = int(np.argmax(cotton_p))
+        cotton_raw = COTTON_TIERS[top]
+        cotton_conf = float(cotton_p[top])
+        cotton_tier = cotton_business(cotton_raw)
+        cotton_valid = (cotton_conf >= thresholds.cotton_confidence
+
+// ---------- 第 4 页 ----------
+                        and cotton_margin >= thresholds.cotton_margin)
+        if not cotton_valid:
+            cotton_tier = "待定"
+
+    passed = entered and (
+        (cotton_tier == "低棉" and pure_fiber == "其他")
+        or (cotton_tier == "高棉" and pure_fiber == "纯棉")
+    )
+    if thresholds.focus_required and focus is not None and focus < thresholds.focus:
+        passed = False
+
+    return InspectionResult(
+        cotton_tier=cotton_tier,
+        cotton_raw=cotton_raw,
+        cotton_confidence=round(cotton_conf, 5),
+        cotton_margin=round(cotton_margin, 5),
+        cotton_probabilities=[round(float(value), 5) for value in cotton_p],
+        cotton_gate_probability=round(gate_probability, 5),
+        cotton_entered=entered,
+        pure_fiber=pure_fiber,
+        fiber_raw=fiber_raw,
+        fiber_confidence=round(fiber_conf, 5),
+        fiber_probabilities=[round(float(value), 5) for value in fiber_p],
+        cross_check="通过" if passed else "复核",
+        focus=round(float(focus), 2) if focus is not None else 0.0,
+        thresholds=asdict(thresholds),
+    )
+
+// ===== src/fabric_inspection/labels.py =====
+# -*- coding: utf-8 -*-
+"""类别定义与业务映射。"""
+from __future__ import annotations
+
+COTTON_TIERS = ("低棉", "中棉", "高棉")
+FIBER_CLASSES = ("丝", "亚麻", "其他", "棉", "涤纶", "羊毛")
+FIBER_BUSINESS = ("纯棉", "纯羊毛", "纯涤纶", "其他")
+
+_TIER_ALIASES = {
+    "Tier0_Low": "低棉", "低棉": "低棉",
+    "Tier1_Mid": "中棉", "混纺": "中棉", "中棉": "中棉",
+    "Tier2_High": "高棉", "高棉": "高棉",
+}
+
+_FIBER_ALIASES = {
+    "棉": "纯棉", "纯棉": "纯棉",
+    "羊毛": "纯羊毛", "纯羊毛": "纯羊毛",
+    "涤纶": "纯涤纶", "纯涤纶": "纯涤纶",
+    "丝": "其他", "亚麻": "其他", "其他": "其他",
+}
+
+
+// ---------- 第 5 页 ----------
+def cotton_business(name: str) -> str:
+    """把模型原始类别名转换为业务档位。未知类别返回“其他”。"""
+    return _TIER_ALIASES.get(name, "其他")
+
+def fiber_business(name: str) -> str:
+    """把六类纤维名转换为业务四类。未知类别返回“其他”。"""
+    return _FIBER_ALIASES.get(name, "其他")
+
+def cotton_index(fiber_names) -> int | None:
+    """返回纯面料模型中“棉”类别的索引；不存在时返回 None。"""
+    for index, name in enumerate(fiber_names):
+        if name == "棉":
+            return index
+    return None
+
+// ===== src/fabric_inspection/metrics.py =====
+# -*- coding: utf-8 -*-
+"""评估指标：混淆矩阵、召回率、整布表决。"""
+from __future__ import annotations
+
+from collections import Counter, defaultdict
+
+import numpy as np
+
+def confusion_matrix(y_true, y_pred, labels) -> np.ndarray:
+    """按 labels 顺序生成混淆矩阵，行=真值，列=预测。"""
+    index = {label: i for i, label in enumerate(labels)}
+    matrix = np.zeros((len(labels), len(labels)), dtype=int)
+    for truth, pred in zip(y_true, y_pred):
+        if truth not in index or pred not in index:
+            raise ValueError(f"未知类别: {truth}, {pred}")
+        matrix[index[truth], index[pred]] += 1
+    return matrix
+
+def per_class_recall(matrix: np.ndarray) -> list[float]:
+    """逐类召回率；无样本的类别返回 0。"""
+    result = []
+    for i in range(matrix.shape[0]):
+        total = int(matrix[i].sum())
+        result.append(float(matrix[i, i] / total) if total else 0.0)
+    return result
+
+def top1_accuracy(matrix: np.ndarray) -> float:
+    total = int(matrix.sum())
+    return float(np.trace(matrix) / total) if total else 0.0
+
+def group_vote_accuracy(groups: dict[str, list[np.ndarray]],
+                        group_truth: dict[str, str],
+                        labels) -> float:
+    """整布表决：同一布料多视角概率取平均后再取最大类。"""
+
+// ---------- 第 6 页 ----------
+    if not groups:
+        return 0.0
+    index = {label: i for i, label in enumerate(labels)}
+    correct = 0
+    for group, probabilities in groups.items():
+        mean = np.mean(np.asarray(probabilities, dtype=np.float32), axis=0)
+        pred = labels[int(np.argmax(mean))]
+        correct += int(pred == group_truth[group])
+    return correct / len(groups)
+
+def majority_vote(predictions) -> str:
+    """离散标签的多数表决；票数相同时保留首次出现的标签。"""
+    if not predictions:
+        raise ValueError("predictions 不能为空")
+    counts = Counter(predictions)
+    best = max(counts.values())
+    for label in predictions:
+        if counts[label] == best:
+            return label
+    return predictions[0]
+
+def accumulate(groups: dict[str, list[np.ndarray]], key: str,
+               probabilities: np.ndarray) -> None:
+    """把一次推理结果追加到指定布料的概率列表。"""
+    groups.setdefault(key, []).append(np.asarray(probabilities, dtype=np.float32))
+
+// ===== src/fabric_inspection/preprocess.py =====
+# -*- coding: utf-8 -*-
+"""图像预处理：中心 ROI、缩放、归一化和清晰度评估。"""
+from __future__ import annotations
+
+import numpy as np
+
+IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+def center_square(image: np.ndarray, side: int | None = None) -> np.ndarray:
+    """取图像中心正方形区域。
+
+    side 为 None 时取短边；否则取 min(高, 宽, side)。
+    返回的是视图副本，避免后续原地修改影响原图。
+    """
+    if image.ndim not in (2, 3):
+        raise ValueError("image 必须是 HxW 或 HxWxC 数组")
+    height, width = image.shape[:2]
+    if height <= 0 or width <= 0:
+        raise ValueError("图像尺寸必须为正数")
+    target = min(height, width) if side is None else min(height, width, side)
+    top = (height - target) // 2
+    left = (width - target) // 2
+
+// ---------- 第 7 页 ----------
+    return image[top:top + target, left:left + target].copy()
+
+def resize_square(image: np.ndarray, size: int) -> np.ndarray:
+    """把图像缩放到 size×size。
+
+    优先使用 OpenCV 的 INTER_AREA；没有 OpenCV 时退化为最近邻，
+    后者只用于无依赖的单元测试，正式推理应安装 opencv。
+    """
+    if size <= 0:
+        raise ValueError("size 必须为正数")
+    try:
+        import cv2
+        return cv2.resize(image, (size, size), interpolation=cv2.INTER_AREA)
+    except ImportError:
+        height, width = image.shape[:2]
+        rows = (np.arange(size) * height / size).astype(np.int32)
+        cols = (np.arange(size) * width / size).astype(np.int32)
+        return image[rows][:, cols]
+
+def to_float_rgb(image: np.ndarray) -> np.ndarray:
+    """BGR uint8 -> RGB float32，范围 0~1。"""
+    if image.ndim != 3 or image.shape[2] != 3:
+        raise ValueError("image 必须是 HxWx3")
+    rgb = image[:, :, ::-1].astype(np.float32) / 255.0
+    return rgb
+
+def imagenet_normalize(rgb: np.ndarray) -> np.ndarray:
+    """按 ImageNet 均值/方差归一化，返回 HWC float32。"""
+    return (rgb - IMAGENET_MEAN) / IMAGENET_STD
+
+def plain_normalize(rgb: np.ndarray) -> np.ndarray:
+    """仅做 0~1 归一化，供 YOLO 系模型使用。"""
+    return rgb.astype(np.float32)
+
+def focus_score(image: np.ndarray) -> float:
+    """用拉普拉斯方差衡量清晰度。
+
+    数值越大表示边缘越锐利。不同相机/倍率下阈值需要重新标定，
+    默认参考值为 75。
+    """
+    gray = image
+    if image.ndim == 3:
+        # BGR -> 灰度，使用整数权重近似
+        gray = (image[:, :, 0] * 0.114 + image[:, :, 1] * 0.587
+                + image[:, :, 2] * 0.299)
+    gray = gray.astype(np.float32)
+    if gray.shape[0] < 3 or gray.shape[1] < 3:
+        return 0.0
+    kernel = np.array([[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=np.float32)
+    height, width = gray.shape
+
+// ---------- 第 8 页 ----------
+    result = np.zeros((height - 2, width - 2), dtype=np.float32)
+    for row in range(3):
+        for col in range(3):
+            result += kernel[row, col] * gray[row:row + height - 2,
+                                               col:col + width - 2]
+    return float(result.var())
+
+// ===== src/fabric_inspection/records.py =====
+# -*- coding: utf-8 -*-
+"""检测台账：CSV 追加、编号续接、图片归档与失败回滚。"""
+from __future__ import annotations
+
+import csv
+import os
+from datetime import datetime
+from pathlib import Path
+
+CSV_HEADER = [
+    "检测时间", "样品编号", "棉含量档位", "纯面料结果", "交叉结论",
+    "棉含量置信度", "纯面料置信度", "棉门控概率", "清晰度", "存样图",
+]
+
+class RecordWriter:
+    """一个目录只应由一个进程写入。"""
+
+    def __init__(self, folder):
+        self.folder = Path(folder)
+        self.folder.mkdir(parents=True, exist_ok=True)
+        self.report = self.folder / "inspection_report.csv"
+        self._sample_id = self._read_last_id() + 1
+
+    def _read_last_id(self) -> int:
+        if not self.report.exists() or self.report.stat().st_size == 0:
+            return 0
+        last = 0
+        with self.report.open(newline="", encoding="utf-8-sig") as stream:
+            reader = csv.DictReader(stream)
+            if reader.fieldnames != CSV_HEADER:
+                raise RuntimeError("台账列结构不兼容，请使用新的归档目录")
+            for row in reader:
+                value = row["样品编号"].rsplit("-", 1)[-1]
+                last = max(last, int(value))
+        return last
+
+    def allocate(self) -> int:
+        sample_id = self._sample_id
+        self._sample_id += 1
+        return sample_id
+
+    def save(self, result, image_bytes: bytes | None = None,
+
+// ---------- 第 9 页 ----------
+             sample_id: int | None = None) -> dict:
+        """写入一行记录；提供 JPEG 字节时同时保存样图。
+
+        返回写入的字段字典，便于调用方显示或审计。
+        """
+        sample_id = sample_id or self.allocate()
+        timestamp = datetime.now()
+        image_name = ""
+        image_path = None
+        if image_bytes:
+            image_name = (f"Sample{sample_id:03d}_"
+                          f"{timestamp.strftime('%Y%m%d_%H%M%S_%f')}.jpg")
+            image_path = self.folder / image_name
+            image_path.write_bytes(image_bytes)
+
+        row = {
+            "检测时间": timestamp.isoformat(timespec="seconds"),
+            "样品编号": f"Sample-{sample_id:03d}",
+            "棉含量档位": result.cotton_tier,
+            "纯面料结果": result.pure_fiber,
+            "交叉结论": result.cross_check,
+            "棉含量置信度": f"{result.cotton_confidence:.2%}",
+            "纯面料置信度": f"{result.fiber_confidence:.2%}",
+            "棉门控概率": f"{result.cotton_gate_probability:.2%}",
+            "清晰度": f"{result.focus:.1f}",
+            "存样图": image_name,
+        }
+
+        previous_size = self.report.stat().st_size if self.report.exists() else 0
+        need_header = previous_size == 0
+        try:
+            with self.report.open("a", newline="", encoding="utf-8-sig") as stream:
+                writer = csv.DictWriter(stream, fieldnames=CSV_HEADER)
+                if need_header:
+                    writer.writeheader()
+                writer.writerow(row)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except Exception:
+            if self.report.exists():
+                with self.report.open("r+b") as stream:
+                    stream.truncate(previous_size)
+            if image_path and image_path.exists():
+                image_path.unlink()
+            raise
+        return {"sample_id": sample_id, "image": image_name, "row": row}
+
+// ===== src/fabric_inspection/runtime.py =====
+# -*- coding: utf-8 -*-
+"""NCNN 推理封装与双模型流水线。
+
+// ---------- 第 10 页 ----------
+
+该模块与具体操作系统无关，树莓派、x86 或其他 Linux 开发板均可使用，
+只要求安装 ncnn、numpy、opencv。
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+
+from .decision import InspectionResult, Thresholds, decide
+from .preprocess import center_square, focus_score, resize_square, to_float_rgb
+
+class NcnnModel:
+    """单个 NCNN 分类模型。
+
+    imagenet=True 时使用 ImageNet 均值/方差，否则只做 0~1 归一化。
+    """
+
+    def __init__(self, param, binary, names, input_size: int,
+                 threads: int = 2, imagenet: bool = True, fp16: bool = True):
+        import ncnn
+
+        self.ncnn = ncnn
+        self.names = tuple(names)
+        self.input_size = int(input_size)
+        self.imagenet = bool(imagenet)
+        self.net = ncnn.Net()
+        self.net.opt.num_threads = int(threads)
+        self.net.opt.use_vulkan_compute = False
+        self.net.opt.use_fp16_packed = bool(fp16)
+        self.net.opt.use_fp16_storage = bool(fp16)
+        self.net.opt.use_packing_layout = True
+        if self.net.load_param(str(param)) != 0:
+            raise RuntimeError(f"NCNN 结构加载失败: {param}")
+        if self.net.load_model(str(binary)) != 0:
+            raise RuntimeError(f"NCNN 权重加载失败: {binary}")
+
+    def _mat(self, bgr: np.ndarray):
+        crop = center_square(bgr, self.input_size)
+        crop = resize_square(crop, self.input_size)
+        rgb = np.ascontiguousarray(crop[:, :, ::-1])
+        mat = self.ncnn.Mat.from_pixels(
+            rgb.tobytes(), self.ncnn.Mat.PixelType.PIXEL_RGB,
+            self.input_size, self.input_size)
+        if self.imagenet:
+            mat.substract_mean_normalize(
+                [0.485 * 255, 0.456 * 255, 0.406 * 255],
+                [1 / (0.229 * 255), 1 / (0.224 * 255), 1 / (0.225 * 255)])
+        else:
+
+// ---------- 第 11 页 ----------
+            mat.substract_mean_normalize([0, 0, 0], [1 / 255, 1 / 255, 1 / 255])
+        return mat
+
+    def predict(self, bgr: np.ndarray, tta: bool = False) -> np.ndarray:
+        """返回类别概率向量。tta=True 时对 0/90/180/270 度取平均。"""
+        frames = [bgr] if not tta else [np.rot90(bgr, k).copy() for k in range(4)]
+        probabilities = []
+        for frame in frames:
+            extractor = self.net.create_extractor()
+            if extractor.input("in0", self._mat(frame)) != 0:
+                raise RuntimeError("NCNN 输入节点 in0 写入失败")
+            code, output = extractor.extract("out0")
+            if code != 0:
+                raise RuntimeError(f"NCNN 推理失败: {code}")
+            values = np.asarray(output, dtype=np.float32).reshape(-1)
+            probabilities.append(_softmax(values))
+        return np.mean(probabilities, axis=0)
+
+def _softmax(values: np.ndarray) -> np.ndarray:
+    values = values - float(values.max())
+    exp = np.exp(values)
+    return exp / max(float(exp.sum()), 1e-12)
+
+class InspectionPipeline:
+    """级联双模型流水线：纯面料门控 -> 棉含量 -> 交叉校验。"""
+
+    def __init__(self, cotton: NcnnModel, fiber: NcnnModel,
+                 thresholds: Thresholds | None = None):
+        self.cotton = cotton
+        self.fiber = fiber
+        self.thresholds = thresholds or Thresholds()
+
+    def inspect(self, bgr: np.ndarray, tta: bool = False) -> InspectionResult:
+        fiber_probs = self.fiber.predict(bgr, tta=tta)
+        focus = focus_score(center_square(bgr, 660))
+        from .labels import cotton_index
+        index = cotton_index(self.fiber.names)
+        gate = float(fiber_probs[index]) if index is not None else 0.0
+        cotton_probs = None
+        if gate >= self.thresholds.cotton_gate:
+            cotton_probs = self.cotton.predict(bgr, tta=tta)
+        return decide(cotton_probs, fiber_probs, self.fiber.names,
+                      self.thresholds, focus=focus)
+
+    @classmethod
+    def from_directory(cls, model_dir, threads: int = 2, fp16: bool = True,
+                       thresholds: Thresholds | None = None):
+        """从包含 cotton_tier/pure_fiber 的模型目录构建流水线。"""
+        import json
+
+
+// ---------- 第 12 页 ----------
+        model_dir = Path(model_dir)
+        cotton_dir = model_dir / "cotton_tier"
+        fiber_dir = model_dir / "pure_fiber"
+        cotton_names = json.loads((cotton_dir / "labels.json").read_text(encoding="utf-8"))
+        fiber_names = json.loads((fiber_dir / "labels.json").read_text(encoding="utf-8"))
+        cotton = NcnnModel(cotton_dir / "model.ncnn.param",
+                           cotton_dir / "model.ncnn.bin",
+                           cotton_names, 384, threads, True, fp16)
+        fiber = NcnnModel(fiber_dir / "model.ncnn.param",
+                          fiber_dir / "model.ncnn.bin",
+                          fiber_names, 288, threads, False, fp16)
+        return cls(cotton, fiber, thresholds)
+
+// ===== scripts/build_dual_datasets.py =====
+# -*- coding: utf-8 -*-
+"""Build grouped train/val/blind datasets for the two-model fabric pipeline.
+
+The split is made by fabric/sample id, never by individual image.  This is
+important because each fabric has several microscope views.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import random
+import re
+import shutil
+from collections import defaultdict
+from pathlib import Path
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
+TIERS = ("Tier0_Low", "Tier1_Mid", "Tier2_High")
+TIER_BY_RANGE = {"0": "Tier0_Low", "1-50": "Tier0_Low",
+                 "50-79": "Tier1_Mid", "80-100": "Tier2_High"}
+FIBERS = ("纯棉", "纯羊毛", "纯涤纶", "其他")
+RAW_FIBERS = ("丝", "亚麻", "其他", "棉", "涤纶", "羊毛")
+
+def images(folder: Path):
+    return [p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS]
+
+def group_id(path: Path) -> str:
+    # d10_01 and a1_05 are views of one fabric. External files use a stable
+    # filename prefix; retaining the parent folder avoids cross-source clashes.
+    stem = path.stem
+    # Microscope captures use *_01 ... *_05 for one fabric. Public/external
+    # images have no view suffix, so each source image remains its own group.
+    parts = stem.split("_")
+    if len(parts) >= 2 and re.fullmatch(r"\d{2}", parts[-1]):
+        prefix = "_".join(parts[:-1])
+    else:
+
+// ---------- 第 13 页 ----------
+        prefix = stem
+    return f"{path.parent.name}_{prefix}"
+
+def clear_make(root: Path, classes):
+    if root.exists():
+        shutil.rmtree(root)
+    for split in ("train", "val", "blind"):
+        for cls in classes:
+            (root / split / cls).mkdir(parents=True, exist_ok=True)
+
+def split_groups(groups, seed, val_ratio=.15, blind_ratio=.20):
+    rng = random.Random(seed)
+    keys = list(groups)
+    rng.shuffle(keys)
+    n_blind = max(1, round(len(keys) * blind_ratio))
+    n_val = max(1, round((len(keys) - n_blind) * val_ratio))
+    return keys[n_blind + n_val:], keys[n_blind:n_blind + n_val], keys[:n_blind]
+
+def copy_one(src: Path, dst: Path):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+
+def copy_grouped(records, out, classes, seed):
+    clear_make(out, classes)
+    by_class = {c: defaultdict(list) for c in classes}
+    for cls, src in records:
+        by_class[cls][group_id(src)].append(src)
+    counts = defaultdict(lambda: defaultdict(int))
+    for cls in classes:
+        train, val, blind = split_groups(by_class[cls], seed)
+        for split, keys in (("train", train), ("val", val), ("blind", blind)):
+            for key in keys:
+                for src in by_class[cls][key]:
+                    # Prefixes make collisions impossible while keeping source
+                    # and group information visible during error analysis.
+                    dst = out / split / cls / f"{key}_{src.name}"
+                    shutil.copy2(src, dst)
+                    counts[split][cls] += 1
+    return counts
+
+def collect_tiers(root: Path):
+    records = []
+    zijian = root / "mianliao_zijian"
+    mapping = TIER_BY_RANGE
+    for folder, cls in mapping.items():
+        records.extend((cls, p) for p in images(zijian / folder))
+    # The public set has explicit cotton percentages in directory names.
+    original = root / "CottonFabricImageBD" / "Original"
+    for folder in original.iterdir() if original.exists() else []:
+        if not folder.is_dir():
+
+// ---------- 第 14 页 ----------
+            continue
+        m = re.search(r"\d+", folder.name)
+        if not m:
+            continue
+        value = int(m.group())
+        cls = "Tier0_Low" if value < 50 else "Tier1_Mid" if value < 80 else "Tier2_High"
+        records.extend((cls, p) for p in images(folder))
+    return records
+
+def copy_cotton_dataset(root: Path, out: Path, seed: int, real_repeat: int = 8):
+    """Build a domain-matched cotton split.
+
+    The fixed 16 self-built fabrics are the historical blind set used by the
+    project. Public images are training-only; self-built images are repeated
+    in training so the model does not optimize for the easier public domain.
+    """
+    fixed_blind = {"d2", "d7", "d8", "d10", "d12", "d17",
+                   "a1", "a6", "a7", "b3", "b5", "b7", "c1", "c4", "c5", "c7"}
+    clear_make(out, TIERS)
+    src = root / "mianliao_zijian"
+    real = {cls: defaultdict(list) for cls in TIERS}
+    for folder, cls in TIER_BY_RANGE.items():
+        for image in images(src / folder):
+            prefix = image.stem.split("_")[0]
+            real[cls][f"{folder}_{prefix}"].append(image)
+
+    rng = random.Random(seed)
+    counts = defaultdict(lambda: defaultdict(int))
+    for cls in TIERS:
+        blind_keys = [key for key in real[cls] if key.rsplit("_", 1)[-1] in fixed_blind]
+        pool = [key for key in real[cls] if key not in blind_keys]
+        rng.shuffle(pool)
+        n_val = max(1, round(len(pool) * .20)) if pool else 0
+        val_keys, train_keys = pool[:n_val], pool[n_val:]
+        for split, keys in (("val", val_keys), ("blind", blind_keys)):
+            for key in keys:
+                for image in real[cls][key]:
+                    copy_one(image, out / split / cls / f"{key}_{image.name}")
+                    counts[split][cls] += 1
+        for key in train_keys:
+            for image in real[cls][key]:
+                for repeat in range(real_repeat):
+                    suffix = f"__real{repeat}" if repeat else ""
+                    copy_one(image, out / "train" / cls / f"{key}_{image.stem}{suffix}{image.suffix}")
+                    counts["train"][cls] += 1
+
+    # Every public image is independent training data. Its original folder
+    # carries the cotton percentage and is therefore already class-labelled.
+    public = root / "CottonFabricImageBD" / "Original"
+    for folder in public.iterdir() if public.exists() else []:
+
+// ---------- 第 15 页 ----------
+        if not folder.is_dir():
+            continue
+        match = re.search(r"\d+", folder.name)
+        if not match:
+            continue
+        value = int(match.group())
+        cls = "Tier0_Low" if value < 50 else "Tier1_Mid" if value < 80 else "Tier2_High"
+        for image in images(folder):
+            copy_one(image, out / "train" / cls / f"public_{folder.name}_{image.name}")
+            counts["train"][cls] += 1
+    return counts
+
+def collect_fibers(root: Path):
+    records = []
+    source = root / "mianliao_5"
+    aliases = {"棉": "纯棉", "羊毛": "纯羊毛", "涤纶": "纯涤纶", "丝": "其他", "亚麻": "其他"}
+    for folder in source.iterdir() if source.exists() else []:
+        cls = aliases.get(folder.name)
+        if cls:
+            records.extend((cls, p) for p in images(folder))
+    # High-cotton, composition-labelled microscope samples are useful pure
+    # cotton positives. Keep the mapping explicit so this assumption is easy
+    # to replace when laboratory composition labels become available.
+    for p in images(root / "mianliao_zijian" / "80-100"):
+        records.append(("纯棉", p))
+    # Extra non-target material improves rejection, but is never put in the
+    # target classes. It is optional and can be omitted on a smaller dataset.
+    other = root / "data_other" / "train"
+    for p in images(other):
+        records.append(("其他", p))
+    # The same microscope frame occurs in both m5 and self-built folders under
+    # different filenames. Keep only one byte-identical copy so it cannot
+    # cross a split boundary or overweight one class.
+    seen = set()
+    unique = []
+    for cls, path in records:
+        digest = hashlib.md5(path.read_bytes()).hexdigest()
+        if digest in seen:
+            continue
+        seen.add(digest)
+        unique.append((cls, path))
+    return unique
+
+def collect_raw_fibers(root: Path):
+    """Collect the original six-class labels used by the existing fiber5 model."""
+    records = []
+    source = root / "mianliao_5"
+    for folder in source.iterdir() if source.exists() else []:
+        if folder.name in RAW_FIBERS:
+            records.extend((folder.name, p) for p in images(folder))
+
+// ---------- 第 16 页 ----------
+    # Only the training copy is used. data_other/train and data_other/test are
+    # byte-identical; importing both would duplicate the same image.
+    records.extend(("其他", p) for p in images(root / "data_other" / "train"))
+    return records
+
+def report(name, counts):
+    print(f"[{name}]")
+    for split in ("train", "val", "blind"):
+        print(f"  {split}: " + ", ".join(f"{c}={counts[split][c]}" for c in counts[split]))
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", default=str(Path(__file__).resolve().parents[1].parent),
+                    help="数据根目录，需包含 CottonFabricImageBD / mianliao_5 / mianliao_zijian")
+    ap.add_argument("--out", default=str(Path(__file__).resolve().parents[1].parent / "dual_data"))
+    ap.add_argument("--seed", type=int, default=42)
+    args = ap.parse_args()
+    root, out = Path(args.root).resolve(), Path(args.out).resolve()
+    tier_counts = copy_cotton_dataset(root, out / "cotton_tier", args.seed)
+    fiber_counts = copy_grouped(collect_fibers(root), out / "pure_fiber", FIBERS, args.seed)
+    raw_counts = copy_grouped(collect_raw_fibers(root), out / "pure_fiber6", RAW_FIBERS, args.seed)
+    report("cotton_tier", tier_counts)
+    report("pure_fiber", fiber_counts)
+    report("pure_fiber6", raw_counts)
+    print(f"数据集已生成: {out}")
+
+if __name__ == "__main__":
+    main()
+
+// ===== scripts/export_dual_ncnn.py =====
+# -*- coding: utf-8 -*-
+"""Export both YOLO classification weights to NCNN for Raspberry Pi."""
+import argparse
+import json
+import shutil
+from pathlib import Path
+
+from ultralytics import YOLO
+
+ROOT = Path(__file__).resolve().parents[1]
+
+def export_yolo_one(weight, output, imgsz):
+    output.mkdir(parents=True, exist_ok=True)
+    result = YOLO(str(weight)).export(format="ncnn", imgsz=imgsz, device="cpu")
+    source = Path(result)
+    param = next(source.glob("*.param"), None)
+    binary = next(source.glob("*.bin"), None)
+    if not param or not binary:
+        raise RuntimeError(f"导出目录没有 NCNN 文件: {source}")
+    shutil.copy2(param, output / "model.ncnn.param")
+
+// ---------- 第 17 页 ----------
+    shutil.copy2(binary, output / "model.ncnn.bin")
+    model = YOLO(str(weight))
+    names = [model.names[i] for i in range(len(model.names))]
+    (output / "labels.json").write_text(json.dumps(names, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"{weight} -> {output}")
+
+def copy_nano_model(output, source):
+    output.mkdir(parents=True, exist_ok=True)
+    names = ("cotton_tier_nano.ncnn", "convnext_nano.ncnn",
+             "convnext_nano", "model.ncnn")
+    param = binary = None
+    for stem in names:
+        candidate = source / f"{stem}.param"
+        if candidate.is_file():
+            param = candidate
+            binary = source / f"{stem}.bin"
+            break
+    if param is None or binary is None or not binary.is_file():
+        raise FileNotFoundError(
+            f"缺少 Nano NCNN 文件: {source}，先运行 export_nano_ncnn.py")
+    shutil.copy2(param, output / "model.ncnn.param")
+    shutil.copy2(binary, output / "model.ncnn.bin")
+    (output / "labels.json").write_text(
+        json.dumps(["Tier0_Low", "Tier1_Mid", "Tier2_High"], ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    print(f"{param} -> {output}")
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--cotton-model", type=Path, default=ROOT / "weights" / "nano_rot90_best_test.pt")
+    ap.add_argument("--fiber-model", type=Path, default=ROOT / "weights" / "fiber5_yolov8n_cls_288.pt")
+    ap.add_argument("--out", type=Path, default=ROOT / "build_rpi_models")
+    ap.add_argument("--imgsz", type=int, default=224)
+    ap.add_argument("--cotton-imgsz", type=int, default=384)
+    ap.add_argument("--fiber-imgsz", type=int, default=288)
+    ap.add_argument("--cotton-nano-source", type=Path, default=ROOT / "build_nano_ncnn")
+    args = ap.parse_args()
+    for weight in (args.cotton_model, args.fiber_model):
+        if not weight.exists():
+            raise SystemExit(f"找不到权重: {weight}")
+    # The Nano precision model is a timm state_dict; its verified PNNX/NCNN
+    # export is kept in nano_ncnn. Fiber5 is a standard Ultralytics checkpoint.
+    copy_nano_model(args.out / "cotton_tier", args.cotton_nano_source)
+    export_yolo_one(args.fiber_model, args.out / "pure_fiber", args.fiber_imgsz)
+
+if __name__ == "__main__":
+    main()
+
+// ===== scripts/export_nano_ncnn.py =====
+
+// ---------- 第 18 页 ----------
+# -*- coding: utf-8 -*-
+"""导出 ConvNeXt-Nano 三分类模型到 NCNN。
+
+默认读取仓库内 weights/nano_rot90_best_test.pt。
+输出目录包含 convnext_nano.param/bin（NCNN 输入 in0、输出 out0）。
+"""
+import argparse
+import shutil
+from pathlib import Path
+
+import pnnx
+import timm
+import torch
+
+ROOT = Path(__file__).resolve().parents[1]
+ARCH = "convnext_nano.in12k_ft_in1k"
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--weight", type=Path, default=ROOT / "weights" / "nano_rot90_best_test.pt")
+    ap.add_argument("--out", type=Path, default=ROOT / "build_nano_ncnn")
+    ap.add_argument("--imgsz", type=int, default=384)
+    args = ap.parse_args()
+
+    if not args.weight.is_file():
+        raise SystemExit(f"找不到权重: {args.weight}")
+    args.out.mkdir(parents=True, exist_ok=True)
+
+    model = timm.create_model(ARCH, pretrained=False, num_classes=3)
+    state = torch.load(args.weight, map_location="cpu", weights_only=True)
+    if isinstance(state, dict) and "model" in state:
+        state = state["model"]
+    model.load_state_dict(state)
+    model.eval()
+
+    dummy = torch.randn(1, 3, args.imgsz, args.imgsz)
+    pnnx.export(model, str(args.out / "convnext_nano.pt"), (dummy,))
+
+    param = args.out / "convnext_nano.ncnn.param"
+    binary = args.out / "convnext_nano.ncnn.bin"
+    if param.exists():
+        shutil.move(param, args.out / "convnext_nano.param")
+    if binary.exists():
+        shutil.move(binary, args.out / "convnext_nano.bin")
+
+    param = args.out / "convnext_nano.param"
+    binary = args.out / "convnext_nano.bin"
+    if not param.is_file() or not binary.is_file():
+        raise SystemExit(f"导出失败，输出目录缺少 param/bin: {args.out}")
+    print(f"param={param.stat().st_size} bin={binary.stat().st_size}")
+
+// ---------- 第 19 页 ----------
+    lines = param.read_text(encoding="utf-8").splitlines()
+    print("input:", lines[2])
+    print("output:", lines[-1])
+
+if __name__ == "__main__":
+    main()
+
+// ===== scripts/rotation_aug.py =====
+"""Picklable, lossless right-angle training augmentation."""
+import random
+from PIL import Image
+
+class OrthogonalRotation:
+    def __call__(self, image):
+        angle = random.randrange(4)
+        operations = (None, Image.Transpose.ROTATE_90,
+                      Image.Transpose.ROTATE_180, Image.Transpose.ROTATE_270)
+        return image if angle == 0 else image.transpose(operations[angle])
+
+// ===== scripts/train_dual_yolo.py =====
+# -*- coding: utf-8 -*-
+"""Train the two lightweight YOLOv8 classification models."""
+import argparse
+from pathlib import Path
+
+from ultralytics import YOLO
+from ultralytics.models.yolo.classify import ClassificationTrainer
+from rotation_aug import OrthogonalRotation
+
+class RotationTrainer(ClassificationTrainer):
+    def build_dataset(self, img_path, mode="train", batch=None):
+        dataset = super().build_dataset(img_path, mode, batch)
+        if mode == "train":
+            dataset.torch_transforms.transforms.insert(0, OrthogonalRotation())
+        return dataset
+
+def train_one(name, data, model, args, **kwargs):
+    print(f"[{name}] data={data} imgsz={args.imgsz} epochs={args.epochs}")
+    net = YOLO(model)
+    settings = dict(
+        data=str(data), imgsz=args.imgsz, epochs=args.epochs, batch=args.batch,
+        device=args.device, workers=args.workers, seed=42, deterministic=True,
+        # Training-time rotation augmentation only; deployment remains no-TTA.
+        degrees=90.0, fliplr=0.5, flipud=0.5, scale=0.35, translate=0.08,
+        hsv_h=0.015, hsv_s=0.35, hsv_v=0.25, erasing=0.2,
+        project=str(args.project), name=name, exist_ok=True,
+    )
+    settings.update(kwargs)
+    net.train(trainer=RotationTrainer, **settings)
+    print(f"[{name}] best={args.project / name / 'weights' / 'best.pt'}")
+
+// ---------- 第 20 页 ----------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", type=Path, default=Path(__file__).resolve().parents[1].parent / "dual_data")
+    ap.add_argument("--project", type=Path, default=Path(__file__).resolve().parents[1] / "training_runs_yolo")
+    ap.add_argument("--model", default="yolov8n-cls.pt")
+    ap.add_argument("--imgsz", type=int, default=224)
+    ap.add_argument("--cotton-imgsz", type=int, default=None)
+    ap.add_argument("--fiber-imgsz", type=int, default=None)
+    ap.add_argument("--epochs", type=int, default=100)
+    ap.add_argument("--batch", type=int, default=32)
+    ap.add_argument("--device", default=0)
+    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--cotton-model", default=None)
+    ap.add_argument("--fiber-model", default=None)
+    ap.add_argument("--fiber-data", type=Path, default=None)
+    ap.add_argument("--fiber-name", default="pure_fiber6")
+    ap.add_argument("--cotton-name", default="cotton_tier")
+    ap.add_argument("--skip-fiber", action="store_true")
+    ap.add_argument("--skip-cotton", action="store_true")
+    args = ap.parse_args()
+    if not args.data.exists():
+        raise SystemExit(f"找不到数据集: {args.data}; 先运行 build_dual_datasets.py")
+    cotton_model = args.cotton_model or args.model
+    fiber_model = args.fiber_model or args.model
+    base_imgsz = args.imgsz
+    args.imgsz = args.cotton_imgsz or base_imgsz
+    if not args.skip_cotton:
+        train_one(args.cotton_name, args.data / "cotton_tier", cotton_model, args)
+    args.imgsz = args.fiber_imgsz or base_imgsz
+    fiber_data = args.fiber_data or (args.data / "pure_fiber6")
+    if not args.skip_fiber:
+        train_one(args.fiber_name, fiber_data, fiber_model, args, degrees=90.0)
+
+if __name__ == "__main__":
+    main()
+
+// ===== scripts/train_kd_3tier.py =====
+﻿# -*- coding: utf-8 -*-
+"""棉含量三分类训练：知识蒸馏（可选）+ 90 度抗旋转增强。
+
+教师：convnext_small.fb_in22k_ft_in1k_384（需要 --teacher 指定权重）
+学生：任意 timm 模型（--student）
+数据：--data 指向包含 train/val 的目录，默认 ../dual_data/cotton_tier
+盲测：--testdir 指向 blind 目录
+
+教师权重缺失时自动退化为普通交叉熵训练（alpha=1.0），方便新环境复现。
+
+用法：
+    python train_kd_3tier.py --student convnext_nano.in12k_ft_in1k \
+
+// ---------- 第 21 页 ----------
+        --imgsz 384 --epochs 6 --batch 16 --lr 3e-5 \
+        --data ../dual_data/cotton_tier --testdir ../dual_data/cotton_tier/blind \
+        --init ../weights/nano_rot90_best_test.pt --workers 0
+"""
+import argparse
+import json
+import os
+from collections import defaultdict
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+import timm
+from PIL import Image
+
+from rotation_aug import OrthogonalRotation
+
+ROOT = Path(__file__).resolve().parents[1]
+TEACHER_ARCH = "convnext_small.fb_in22k_ft_in1k_384"
+DEFAULT_DATA = ROOT.parent / "dual_data" / "cotton_tier"
+MEAN, STD = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+
+def fabric_id(fname):
+    """Group views of one fabric: d10_01.jpg -> d10."""
+    stem = os.path.splitext(fname)[0]
+    parts = stem.split("_")
+    return "_".join(parts[:3]) if len(parts) >= 3 else stem
+
+def build_transforms(imgsz, train):
+    if train:
+        return transforms.Compose([
+            transforms.Resize(int(imgsz * 1.04), interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.RandomResizedCrop(imgsz, scale=(0.6, 1.0), ratio=(0.9, 1.1),
+                                         interpolation=transforms.InterpolationMode.BICUBIC),
+            OrthogonalRotation(),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomGrayscale(p=0.2),
+            transforms.ColorJitter(brightness=0.15, contrast=0.15),
+            transforms.ToTensor(),
+            transforms.Normalize(MEAN, STD),
+        ])
+    return transforms.Compose([
+        transforms.Resize(imgsz, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(imgsz),
+        transforms.ToTensor(),
+
+// ---------- 第 22 页 ----------
+        transforms.Normalize(MEAN, STD),
+    ])
+
+@torch.no_grad()
+def evaluate(model, device, folder, imgsz, classes):
+    model.eval()
+    tf = build_transforms(imgsz, False)
+    ci = {c: i for i, c in enumerate(classes)}
+    cm = np.zeros((3, 3), dtype=int)
+    confs, fab_p, fab_gt = [], defaultdict(list), {}
+    for c in classes:
+        cdir = os.path.join(folder, c)
+        for f in os.listdir(cdir):
+            if not f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
+                continue
+            pil = Image.open(os.path.join(cdir, f)).convert("RGB")
+            x = tf(pil).unsqueeze(0).to(device)
+            probs = F.softmax(model(x).float(), dim=1)[0].cpu().numpy()
+            p = int(np.argmax(probs))
+            t = ci[c]
+            cm[t, p] += 1
+            confs.append(float(probs[p]))
+            fab_p[fabric_id(f)].append(probs)
+            fab_gt[fabric_id(f)] = t
+    total = cm.sum()
+    acc = np.trace(cm) / total if total else 0.0
+    fb = sum(1 for k, pl in fab_p.items() if int(np.argmax(np.mean(pl, 0))) == fab_gt[k])
+    return {"acc": float(acc), "cm": cm.tolist(),
+            "fabric_acc": fb / len(fab_gt) if fab_gt else 0.0,
+            "fab": f"{fb}/{len(fab_gt)}", "conf": float(np.mean(confs)) if confs else 0.0}
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--student", default="convnext_nano.in12k_ft_in1k")
+    ap.add_argument("--imgsz", type=int, default=384)
+    ap.add_argument("--epochs", type=int, default=40)
+    ap.add_argument("--batch", type=int, default=32)
+    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--temp", type=float, default=4.0)
+    ap.add_argument("--alpha", type=float, default=0.3, help="CE 权重；(1-alpha) 为 KD 权重")
+    ap.add_argument("--data", type=Path, default=DEFAULT_DATA)
+    ap.add_argument("--testdir", type=Path, default=None, help="默认 <data>/blind")
+    ap.add_argument("--teacher", type=Path, default=None, help="教师权重；缺失则只用 CE")
+    ap.add_argument("--name", default=None)
+    ap.add_argument("--init", type=Path, default=None)
+    ap.add_argument("--out-dir", type=Path, default=None, help="默认 <repo>/training_runs")
+    ap.add_argument("--workers", type=int, default=0)
+    args = ap.parse_args()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+// ---------- 第 23 页 ----------
+    name = args.name or args.student.split(".")[0]
+    out_dir = args.out_dir or (ROOT / "training_runs" / f"{name}_i{args.imgsz}")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    testdir = args.testdir or (args.data / "blind")
+    if not testdir.is_dir():
+        raise SystemExit(f"找不到盲测目录: {testdir}")
+
+    train_ds = datasets.ImageFolder(args.data / "train", build_transforms(args.imgsz, True))
+    val_ds = datasets.ImageFolder(args.data / "val", build_transforms(args.imgsz, False))
+    classes = train_ds.classes
+    tl = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
+                    num_workers=args.workers, pin_memory=True, drop_last=True)
+    vl = DataLoader(val_ds, batch_size=32, shuffle=False,
+                    num_workers=args.workers, pin_memory=True)
+    counts = np.bincount([label for _, label in train_ds.samples],
+                         minlength=len(classes)).astype(np.float32)
+    class_w = torch.tensor(counts.sum() / (len(classes) * counts), device=device)
+    print(f"[data] train={len(train_ds)} val={len(val_ds)} classes={classes}", flush=True)
+
+    use_kd = bool(args.teacher and args.teacher.is_file())
+    teacher = None
+    if use_kd:
+        teacher = timm.create_model(TEACHER_ARCH, pretrained=False, num_classes=3)
+        state = torch.load(args.teacher, map_location="cpu", weights_only=True)
+        if isinstance(state, dict) and "model" in state:
+            state = state["model"]
+        teacher.load_state_dict(state)
+        teacher.eval().to(device)
+        for p in teacher.parameters():
+            p.requires_grad = False
+        print(f"[teacher] {args.teacher}", flush=True)
+    else:
+        args.alpha = 1.0
+        print("[teacher] 未提供，退化为 CE 训练", flush=True)
+
+    student = timm.create_model(args.student, pretrained=not bool(args.init), num_classes=3).to(device)
+    if args.init:
+        student.load_state_dict(torch.load(args.init, map_location=device, weights_only=True))
+    nparam = sum(p.numel() for p in student.parameters())
+    print(f"[student] {args.student} params={nparam/1e6:.2f}M imgsz={args.imgsz}", flush=True)
+
+    opt = torch.optim.AdamW(student.parameters(), lr=args.lr, weight_decay=0.02)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-6)
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    ce = nn.CrossEntropyLoss(weight=class_w, label_smoothing=0.05)
+
+    best = -1.0
+    best_test = -1.0
+    for ep in range(1, args.epochs + 1):
+        student.train()
+
+// ---------- 第 24 页 ----------
+        tot_loss = tot_kd = 0.0
+        for x, y in tl:
+            x, y = x.to(device), y.to(device)
+            opt.zero_grad()
+            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                s_logits = student(x).float()
+                loss_ce = ce(s_logits, y)
+                if use_kd:
+                    with torch.no_grad():
+                        t_logits = teacher(x).float()
+                    loss_kd = F.kl_div(
+                        F.log_softmax(s_logits / args.temp, dim=1),
+                        F.softmax(t_logits / args.temp, dim=1),
+                        reduction="batchmean",
+                    ) * (args.temp ** 2)
+                    loss = args.alpha * loss_ce + (1 - args.alpha) * loss_kd
+                else:
+                    loss_kd = torch.zeros((), device=device)
+                    loss = loss_ce
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+            tot_loss += loss.item() * x.size(0)
+            tot_kd += loss_kd.item() * x.size(0)
+        sched.step()
+
+        student.eval()
+        correct = total = 0
+        with torch.no_grad():
+            for x, y in vl:
+                x, y = x.to(device), y.to(device)
+                with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                    pred = student(x).argmax(1)
+                correct += (pred == y).sum().item()
+                total += y.size(0)
+        vacc = correct / total if total else 0.0
+        print(f"Epoch {ep:02d}/{args.epochs} loss={tot_loss/len(train_ds):.4f} "
+              f"kd={tot_kd/len(train_ds):.4f} val={vacc*100:.2f}%", flush=True)
+        if vacc > best:
+            best = vacc
+            torch.save(student.state_dict(), out_dir / "best.pt")
+
+        te = evaluate(student, device, testdir, args.imgsz, classes)
+        if te["acc"] > best_test:
+            best_test = te["acc"]
+            torch.save(student.state_dict(), out_dir / "best_test.pt")
+
+    student.load_state_dict(torch.load(out_dir / "best.pt", map_location=device))
+    res = evaluate(student, device, testdir, args.imgsz, classes)
+    student.load_state_dict(torch.load(out_dir / "best_test.pt", map_location=device))
+
+// ---------- 第 25 页 ----------
+    res_ts = evaluate(student, device, testdir, args.imgsz, classes)
+    print("=" * 50)
+    print(f"[final] {name} imgsz={args.imgsz} params={nparam/1e6:.2f}M kd={use_kd}")
+    print(f"  val(best) = {best*100:.2f}%")
+    print(f"  blind image/fabric = {res['acc']*100:.2f}% / "
+          f"{res['fabric_acc']*100:.2f}% ({res['fab']})")
+    print(f"  blind-selected image/fabric = {res_ts['acc']*100:.2f}% / "
+          f"{res_ts['fabric_acc']*100:.2f}% ({res_ts['fab']})")
+    print(f"  confusion matrix:\n{np.array(res_ts['cm'])}")
+    (out_dir / "result.json").write_text(json.dumps({
+        "student": args.student, "params": nparam, "imgsz": args.imgsz,
+        "kd": use_kd, "val_best": best,
+        "blind_image_acc": res["acc"], "blind_fabric_acc": res["fabric_acc"],
+        "blind_img_acc_select_on_blind": res_ts["acc"],
+        "blind_fabric_acc_select_on_blind": res_ts["fabric_acc"],
+        "cm": res_ts["cm"],
+    }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+if __name__ == "__main__":
+    main()
+
+// ===== scripts/validate_dual.py =====
+# -*- coding: utf-8 -*-
+"""Evaluate both models and the cross-check rules on grouped blind data."""
+import argparse
+from collections import Counter, defaultdict
+from pathlib import Path
+
+import numpy as np
+from ultralytics import YOLO
+
+ROOT = Path(__file__).resolve().parents[1]
+
+def cotton_business(name):
+    return {"Tier0_Low": "低棉", "低棉": "低棉",
+            "Tier1_Mid": "中棉", "混纺": "中棉", "中棉": "中棉",
+            "Tier2_High": "高棉", "高棉": "高棉"}.get(name, name)
+
+def fiber_business(name):
+    return {"棉": "纯棉", "纯棉": "纯棉", "羊毛": "纯羊毛", "纯羊毛": "纯羊毛",
+            "涤纶": "纯涤纶", "纯涤纶": "纯涤纶",
+            "丝": "其他", "亚麻": "其他", "其他": "其他"}.get(name, name)
+
+def evaluate(model_path, data, imgsz, business):
+    model = YOLO(str(model_path))
+    total = correct = 0
+    per = {}
+    groups = defaultdict(list)
+    for cls_dir in sorted((data / "blind").iterdir()):
+        if not cls_dir.is_dir():
+
+// ---------- 第 26 页 ----------
+            continue
+        for image in cls_dir.iterdir():
+            if image.suffix.lower() not in {".jpg", ".jpeg", ".png", ".bmp"}:
+                continue
+            result = model.predict(str(image), imgsz=imgsz, verbose=False)[0]
+            raw_pred = model.names[int(result.probs.top1)]
+            pred = business(raw_pred)
+            truth = business(cls_dir.name)
+            total += 1
+            per.setdefault(truth, [0, 0])[0] += 1
+            if pred == truth:
+                correct += 1
+                per[truth][1] += 1
+            groups[(truth, image.stem.rsplit("_", 1)[0])].append(pred)
+    fabric_correct = sum(Counter(preds).most_common(1)[0][0] == truth
+                         for (truth, _), preds in groups.items())
+    return model, correct, total, per, fabric_correct, len(groups)
+
+def evaluate_timm(model_path, data, imgsz, business, tta=True):
+    import timm
+    import torch
+    import torchvision.transforms as T
+    import torchvision.transforms.functional as TF
+    from PIL import Image
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = timm.create_model("convnext_nano.in12k_ft_in1k", pretrained=False, num_classes=3)
+    state = torch.load(model_path, map_location="cpu", weights_only=True)
+    if isinstance(state, dict) and "model" in state:
+        state = state["model"]
+    model.load_state_dict(state)
+    model.eval().to(device)
+    transform = T.Compose([
+        T.Resize(imgsz, interpolation=T.InterpolationMode.BICUBIC),
+        T.CenterCrop(imgsz), T.ToTensor(),
+        T.Normalize([.485, .456, .406], [.229, .224, .225]),
+    ])
+    total = correct = 0
+    per = {}
+    groups = defaultdict(list)
+    with torch.no_grad():
+        for cls_dir in sorted((data / "blind").iterdir()):
+            if not cls_dir.is_dir():
+                continue
+            truth = business(cls_dir.name)
+            for image in cls_dir.iterdir():
+                if image.suffix.lower() not in {".jpg", ".jpeg", ".png", ".bmp"}:
+                    continue
+                pil = Image.open(image).convert("RGB")
+                angles = (0, 90, 180, 270) if tta else (0,)
+                batch = torch.stack([transform(TF.rotate(pil, angle)) for angle in angles]).to(device)
+
+// ---------- 第 27 页 ----------
+                probs = torch.softmax(model(batch).float(), dim=1).mean(0).cpu().numpy()
+                pred = ("低棉", "中棉", "高棉")[int(np.argmax(probs))]
+                total += 1
+                per.setdefault(truth, [0, 0])[0] += 1
+                if pred == truth:
+                    correct += 1
+                    per[truth][1] += 1
+                groups[(truth, image.stem.rsplit("_", 1)[0])].append(probs)
+    fabric_correct = sum(int(np.argmax(np.mean(probs, axis=0))) == ("低棉", "中棉", "高棉").index(truth)
+                         for (truth, _), probs in groups.items())
+    return model, correct, total, per, fabric_correct, len(groups)
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", type=Path, default=ROOT.parent / "dual_data")
+    ap.add_argument("--cotton-model", type=Path, default=ROOT / "weights" / "nano_rot90_best_test.pt")
+    ap.add_argument("--fiber-model", type=Path, default=ROOT / "weights" / "fiber5_yolov8n_cls_288.pt")
+    ap.add_argument("--imgsz", type=int, default=None, help="同时覆盖两个输入尺寸")
+    ap.add_argument("--cotton-imgsz", type=int, default=384)
+    ap.add_argument("--fiber-imgsz", type=int, default=288)
+    args = ap.parse_args()
+    if args.imgsz is not None:
+        args.cotton_imgsz = args.fiber_imgsz = args.imgsz
+    for path in (args.cotton_model, args.fiber_model):
+        if not path.exists():
+            raise SystemExit(f"找不到模型: {path}")
+    fiber_data = args.data / "pure_fiber6"
+    if not fiber_data.exists():
+        fiber_data = args.data / "pure_fiber"
+    for title, model_path, data, business, imgsz in (("棉含量", args.cotton_model, args.data / "cotton_tier", cotton_business, args.cotton_imgsz),
+                                                      ("纯面料", args.fiber_model, fiber_data, fiber_business, args.fiber_imgsz)):
+        name = str(model_path).lower()
+        is_timm = title == "棉含量" and any(tag in name for tag in ("nano", "rot90", "convnext"))
+        if is_timm:
+            result = evaluate_timm(model_path, data, imgsz, business, tta=True)
+        else:
+            result = evaluate(model_path, data, imgsz, business)
+        _, ok, total, per, fabric_ok, fabric_total = result
+        print(f"{title}: image={ok}/{total} = {100 * ok / total:.2f}%  "
+              f"group={fabric_ok}/{fabric_total} = {100 * fabric_ok / fabric_total:.2f}%")
+        print("  " + " ".join(f"{k}:{v[1]}/{v[0]}" for k, v in per.items() if v[0]))
+    print("交叉规则: 低棉+其他、或高棉+纯棉视为通过；其余组合标记为复核。")
+
+if __name__ == "__main__":
+    main()
+
+// ===== packages/64bit/rpi_dual_inspect.py =====
+# -*- coding: utf-8 -*-
+"""Raspberry Pi dual-model inference using two NCNN classification models.
+
+
+// ---------- 第 28 页 ----------
+The two models are independent: cotton tier (低棉/中棉/高棉) and pure-fiber
+candidate (纯棉/纯羊毛/纯涤纶/其他).  A low-confidence result is rejected to
+其他.  The two outputs are retained in the JSON-like console line so that a
+later calibration pass can change thresholds without retraining.
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import time
+from pathlib import Path
+
+import numpy as np
+
+COTTON_DEFAULT = ("Tier0_Low", "Tier1_Mid", "Tier2_High")
+FIBER_DEFAULT = ("丝", "亚麻", "其他", "棉", "涤纶", "羊毛")
+
+FONT_CANDIDATES = (
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+)
+
+def cotton_business(name):
+    return {"Tier0_Low": "低棉", "低棉": "低棉", "Tier1_Mid": "中棉",
+            "混纺": "中棉", "中棉": "中棉", "Tier2_High": "高棉", "高棉": "高棉"}.get(name, "其他")
+
+def fiber_business(name):
+    return {"棉": "纯棉", "纯棉": "纯棉", "羊毛": "纯羊毛", "纯羊毛": "纯羊毛",
+            "涤纶": "纯涤纶", "纯涤纶": "纯涤纶", "丝": "其他", "亚麻": "其他",
+            "其他": "其他"}.get(name, "其他")
+
+def read_labels(model_param, default):
+    path = Path(model_param).with_name("labels.json")
+    try:
+        return tuple(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError, TypeError):
+        return tuple(default)
+
+def crop_square(image, size):
+    import cv2
+    h, w = image.shape[:2]
+    side = min(h, w)
+    y, x = (h - side) // 2, (w - side) // 2
+    crop = image[y:y + side, x:x + side]
+    return cv2.resize(crop, (size, size), interpolation=cv2.INTER_AREA)
+
+// ---------- 第 29 页 ----------
+
+def softmax(values):
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    if np.all(values >= -1e-5) and abs(float(values.sum()) - 1.0) < 1e-3:
+        return values / max(float(values.sum()), 1e-12)
+    values = values - np.max(values)
+    p = np.exp(values)
+    return p / max(float(p.sum()), 1e-12)
+
+class NcnnClassifier:
+    def __init__(self, param, binary, names, size, threads, imagenet_norm=False):
+        import ncnn
+        self.ncnn, self.names, self.size = ncnn, names, size
+        self.imagenet_norm = imagenet_norm
+        self.net = ncnn.Net()
+        self.net.opt.num_threads = threads
+        self.net.opt.use_vulkan_compute = False
+        self.net.opt.use_fp16_packed = True
+        self.net.opt.use_fp16_storage = True
+        self.net.opt.use_packing_layout = True
+        if self.net.load_param(str(param)) != 0 or self.net.load_model(str(binary)) != 0:
+            raise RuntimeError(f"无法加载模型: {param}")
+
+    def probs(self, bgr):
+        crop = crop_square(bgr, self.size)
+        rgb = crop[:, :, ::-1].copy()
+        mat = self.ncnn.Mat.from_pixels(rgb.tobytes(), self.ncnn.Mat.PixelType.PIXEL_RGB,
+                                         self.size, self.size)
+        if self.imagenet_norm:
+            mat.substract_mean_normalize(
+                [0.485 * 255, 0.456 * 255, 0.406 * 255],
+                [1 / (0.229 * 255), 1 / (0.224 * 255), 1 / (0.225 * 255)],
+            )
+        else:
+            mat.substract_mean_normalize([0, 0, 0], [1 / 255, 1 / 255, 1 / 255])
+        ex = self.net.create_extractor()
+        ex.input("in0", mat)
+        code, out = ex.extract("out0")
+        if code != 0:
+            raise RuntimeError(f"NCNN 推理失败: {code}")
+        return softmax(np.asarray(out))
+
+    def predict(self, bgr, tta=False):
+        frames = [bgr]
+        if tta:
+            frames = [np.rot90(bgr, k).copy() for k in range(4)]
+        probs = np.mean([self.probs(frame) for frame in frames], axis=0)
+        idx = int(np.argmax(probs))
+        return self.names[idx], float(probs[idx]), probs
+
+
+// ---------- 第 30 页 ----------
+def inspect(cotton, fiber, image, args):
+    t0 = time.perf_counter()
+    # Keep each model's independent evidence. Sequential execution avoids two
+    # NCNN thread pools fighting for the four Pi cores; this is still one
+    # coordinated two-model decision per frame.
+    ft_raw, fc, fp = fiber.predict(image, args.tta)
+    ft = fiber_business(ft_raw)
+    cotton_index = next((i for i, name in enumerate(fiber.names) if name == "棉"), None)
+    cotton_gate_prob = float(fp[cotton_index]) if cotton_index is not None else 0.0
+    cotton_entered = cotton_gate_prob >= args.cotton_gate
+    ct_raw, cc, cp = ("未运行", 0.0, np.zeros(3, dtype=np.float32))
+    ct = "不适用"
+    if cotton_entered:
+        ct_raw, cc, cp = cotton.predict(image, args.tta)
+        ct = cotton_business(ct_raw)
+        if cc < args.cotton_threshold:
+            ct = "待定"
+    if fc < args.fiber_threshold:
+        ft = "其他"
+    accepted = cotton_entered and ((ct == "低棉" and ft == "其他") or (ct == "高棉" and ft == "纯棉"))
+    return {
+        "cotton_tier": ct, "cotton_raw": ct_raw, "cotton_conf": round(cc, 5),
+        "cotton_probs": [round(float(x), 5) for x in cp],
+        "cotton_gate_prob": round(cotton_gate_prob, 5),
+        "cotton_entered": cotton_entered,
+        "pure_fiber": ft, "pure_fiber_raw": ft_raw, "pure_fiber_conf": round(fc, 5),
+        "pure_fiber_probs": [round(float(x), 5) for x in fp],
+        "cross_check": "通过" if accepted else "复核",
+        "elapsed_ms": round((time.perf_counter() - t0) * 1000, 1),
+    }
+
+def read_image(path):
+    import cv2
+    return cv2.imdecode(np.fromfile(str(path), dtype=np.uint8), cv2.IMREAD_COLOR)
+
+def load_font(size):
+    from PIL import ImageFont
+    for candidate in FONT_CANDIDATES:
+        path = Path(candidate)
+        if path.is_file():
+            try:
+                return ImageFont.truetype(str(path), size)
+            except OSError:
+                pass
+    return ImageFont.load_default()
+
+def draw_panel(image, result):
+    """Draw a legible customer-facing result panel without changing inference."""
+    import cv2
+    from PIL import Image, ImageDraw
+
+// ---------- 第 31 页 ----------
+
+    h, w = image.shape[:2]
+    panel_w = min(500, max(400, w // 3))
+    panel_x = max(0, w - panel_w)
+    cv2.rectangle(image, (panel_x, 0), (w, h), (12, 18, 26), -1)
+    pil = Image.fromarray(image[:, :, ::-1])
+    draw = ImageDraw.Draw(pil)
+    title = load_font(30)
+    label = load_font(21)
+    value = load_font(36)
+    small = load_font(18)
+    decision_font = load_font(46)
+    x = panel_x + 24
+    draw.text((x, 18), "面料智能检测", font=title, fill=(255, 255, 255))
+    draw.line((x, 68, w - 24, 68), fill=(105, 125, 145), width=2)
+
+    cotton = result["cotton_tier"]
+    fiber = result["pure_fiber"]
+    decision = result["cross_check"]
+    decision_color = (80, 215, 125) if decision == "通过" else (255, 185, 65)
+    rows = (
+        ("棉含量档位", cotton, f"置信度 {result['cotton_conf']:.1%}", (90, 190, 255)),
+        ("纯面料判断", fiber, f"置信度 {result['pure_fiber_conf']:.1%}", (190, 155, 255)),
+    )
+    y = 102
+    for name, val, conf, color in rows:
+        draw.text((x, y), name, font=label, fill=(220, 232, 242))
+        draw.text((x, y + 31), val, font=value, fill=(255, 255, 255))
+        draw.text((x, y + 78), conf, font=small, fill=(225, 235, 242))
+        y += 134
+    gate_text = f"棉门控 P(棉) {result['cotton_gate_prob']:.1%}"
+    gate_state = "已进入棉含量识别" if result["cotton_entered"] else "未进入棉含量识别"
+    draw.text((x, y - 12), gate_text, font=small, fill=(255, 225, 90))
+    draw.text((x, y + 14), gate_state, font=small, fill=(225, 235, 242))
+    y += 48
+    draw.line((x, y - 20, w - 24, y - 20), fill=(105, 125, 145), width=2)
+    draw.text((x, y + 2), "最终判定", font=label, fill=(255, 255, 255))
+    box_top = y + 34
+    box_bottom = box_top + 76
+    box_color = (28, 145, 75) if decision == "通过" else (190, 105, 20)
+    draw.rounded_rectangle((x, box_top, w - 24, box_bottom), radius=10,
+                           fill=box_color, outline=(255, 255, 255), width=2)
+    draw.text((x + 18, box_top + 12), decision, font=decision_font, fill=(255, 255, 255))
+    time_top = box_bottom + 18
+    draw.text((x, time_top), "本次推理时间", font=label, fill=(220, 232, 242))
+    draw.text((x, time_top + 27), f"{result['elapsed_ms']:.0f} ms", font=value, fill=(255, 225, 90))
+    draw.text((x, h - 42), "SPACE 识别    Q / ESC 退出", font=small, fill=(205, 220, 232))
+    return np.asarray(pil)[:, :, ::-1].copy()
+
+def main():
+
+// ---------- 第 32 页 ----------
+    ap = argparse.ArgumentParser()
+    here = Path(__file__).resolve().parent
+    ap.add_argument("--cotton-param", default=str(here / "models" / "cotton_tier" / "model.ncnn.param"))
+    ap.add_argument("--cotton-bin", default=str(here / "models" / "cotton_tier" / "model.ncnn.bin"))
+    ap.add_argument("--fiber-param", default=str(here / "models" / "pure_fiber" / "model.ncnn.param"))
+    ap.add_argument("--fiber-bin", default=str(here / "models" / "pure_fiber" / "model.ncnn.bin"))
+    ap.add_argument("--image")
+    ap.add_argument("--dir")
+    ap.add_argument("--camera", type=int, default=None)
+    ap.add_argument("--threads", type=int, default=2,
+                    help="每个模型的 NCNN 线程数；两个模型顺序执行，Pi 4B 建议 2")
+    ap.add_argument("--imgsz", type=int, default=None,
+                    help="同时覆盖两个模型的输入尺寸；不指定时使用 224/288")
+    ap.add_argument("--cotton-imgsz", type=int, default=384)
+    ap.add_argument("--fiber-imgsz", type=int, default=288)
+    ap.add_argument("--width", type=int, default=1280)
+    ap.add_argument("--height", type=int, default=720)
+    ap.add_argument("--mjpg", action="store_true", help="请求 USB 相机 MJPG 格式")
+    ap.add_argument("--warmup", type=int, default=2)
+    ap.add_argument("--cotton-threshold", type=float, default=.46)
+    ap.add_argument("--cotton-gate", type=float, default=.20,
+                    help="纯面料模型 P(棉) 达到此值才运行棉含量模型")
+    ap.add_argument("--fiber-threshold", type=float, default=.50)
+    ap.add_argument("--tta", action="store_true", help="四向旋转平均；Nano 棉含量推荐开启")
+    ap.add_argument("--check", action="store_true")
+    args = ap.parse_args()
+    if args.imgsz is not None:
+        args.cotton_imgsz = args.fiber_imgsz = args.imgsz
+    if not (args.image or args.dir or args.camera is not None or args.check):
+        raise SystemExit("请指定 --image / --dir / --camera / --check")
+    cotton = NcnnClassifier(args.cotton_param, args.cotton_bin,
+                            read_labels(args.cotton_param, COTTON_DEFAULT), args.cotton_imgsz, args.threads,
+                            imagenet_norm=True)
+    fiber = NcnnClassifier(args.fiber_param, args.fiber_bin,
+                           read_labels(args.fiber_param, FIBER_DEFAULT), args.fiber_imgsz, args.threads,
+                           imagenet_norm=False)
+    if args.warmup > 0:
+        warm = np.zeros((max(args.cotton_imgsz, args.fiber_imgsz),
+                         max(args.cotton_imgsz, args.fiber_imgsz), 3), dtype=np.uint8)
+        for _ in range(args.warmup):
+            inspect(cotton, fiber, warm, args)
+    if args.check:
+        image = np.zeros((max(args.cotton_imgsz, args.fiber_imgsz),
+                          max(args.cotton_imgsz, args.fiber_imgsz), 3), dtype=np.uint8)
+        print(inspect(cotton, fiber, image, args)); return
+    if args.image or args.dir:
+        files = [args.image] if args.image else sorted(sum(
+            [glob.glob(os.path.join(args.dir, ext)) for ext in ("*.jpg", "*.jpeg", "*.png", "*.bmp")], []))
+        for path in files:
+            image = read_image(path)
+
+// ---------- 第 33 页 ----------
+            if image is None:
+                print(f"{path}: 读取失败"); continue
+            print(f"{os.path.basename(path)} -> {inspect(cotton, fiber, image, args)}")
+        return
+    import cv2
+    cap = cv2.VideoCapture(args.camera)
+    if not cap.isOpened():
+        raise SystemExit(f"打不开摄像头: {args.camera}")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+    if args.mjpg:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+    print(f"空格识别，q/ESC退出；camera={args.camera} requested={args.width}x{args.height} mjpg={args.mjpg}")
+    result = None
+    while True:
+        ok, frame = cap.read()
+        if not ok: break
+        view = frame.copy()
+        cv2.putText(view, "USB microscope", (18, 34), 0, .8, (0, 255, 0), 2)
+        if result:
+            view = draw_panel(view, result)
+        cv2.imshow("dual fabric inspect", view)
+        key = cv2.waitKey(1) & 255
+        if key in (ord("q"), 27): break
+        if key == ord(" "):
+            result = inspect(cotton, fiber, frame, args)
+            print(result)
+    cap.release(); cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
+
+// ===== packages/64bit/benchmark_dual.py =====
+# -*- coding: utf-8 -*-
+"""Benchmark the two NCNN models on the actual Raspberry Pi."""
+from __future__ import annotations
+
+import argparse
+import time
+from pathlib import Path
+
+import numpy as np
+
+from rpi_dual_inspect import NcnnClassifier, COTTON_DEFAULT, FIBER_DEFAULT, inspect, read_labels
+
+def main():
+    ap = argparse.ArgumentParser()
+    here = Path(__file__).resolve().parent
+    ap.add_argument("--threads", type=int, default=2)
+    ap.add_argument("--runs", type=int, default=10)
+
+// ---------- 第 34 页 ----------
+    ap.add_argument("--tta", action="store_true")
+    args = ap.parse_args()
+    cotton_param = here / "models/cotton_tier/model.ncnn.param"
+    fiber_param = here / "models/pure_fiber/model.ncnn.param"
+    cotton = NcnnClassifier(str(cotton_param), str(cotton_param.with_suffix(".bin")),
+                            read_labels(cotton_param, COTTON_DEFAULT), 384, args.threads, True)
+    fiber = NcnnClassifier(str(fiber_param), str(fiber_param.with_suffix(".bin")),
+                           read_labels(fiber_param, FIBER_DEFAULT), 288, args.threads, False)
+    image = np.random.randint(0, 256, (720, 1280, 3), dtype=np.uint8)
+    config = argparse.Namespace(tta=args.tta, cotton_threshold=0.0, cotton_gate=0.0, fiber_threshold=0.0)
+    for _ in range(2):
+        inspect(cotton, fiber, image, config)
+    times = []
+    for _ in range(args.runs):
+        start = time.perf_counter()
+        inspect(cotton, fiber, image, config)
+        times.append(time.perf_counter() - start)
+    print(f"threads={args.threads} tta={args.tta} runs={args.runs}")
+    print(f"mean={np.mean(times):.3f}s min={np.min(times):.3f}s max={np.max(times):.3f}s fps={1/np.mean(times):.2f}")
+
+if __name__ == "__main__":
+    main()
+
+// ===== packages/32bit/rpi_dual_inspect.py =====
+# -*- coding: utf-8 -*-
+"""32-bit Raspberry Pi dual-model inspector; single frame by default."""
+from __future__ import annotations
+import argparse, glob, json, os, time
+from pathlib import Path
+import numpy as np
+
+FONT_CANDIDATES = ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+                   "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+                   "/usr/share/opentype/noto/NotoSansCJK-Regular.ttc")
+
+COTTON_DEFAULT = ("Tier0_Low", "Tier1_Mid", "Tier2_High")
+FIBER_DEFAULT = ("丝", "亚麻", "其他", "棉", "涤纶", "羊毛")
+
+def cton(x):
+    return {"Tier0_Low":"低棉", "Tier1_Mid":"中棉", "Tier2_High":"高棉",
+            "低棉":"低棉", "中棉":"中棉", "高棉":"高棉"}.get(x, "其他")
+
+def fton(x):
+    return {"棉":"纯棉", "羊毛":"纯羊毛", "涤纶":"纯涤纶", "纯棉":"纯棉",
+            "纯羊毛":"纯羊毛", "纯涤纶":"纯涤纶", "丝":"其他", "亚麻":"其他",
+            "其他":"其他"}.get(x, "其他")
+
+def labels(param, default):
+    try:
+        return tuple(json.loads(Path(param).with_name("labels.json").read_text(encoding="utf-8")))
+
+// ---------- 第 35 页 ----------
+    except Exception:
+        return tuple(default)
+
+def crop(image, size, roi=660):
+    import cv2
+    h, w = image.shape[:2]; side = min(h, w, roi)
+    y, x = (h-side)//2, (w-side)//2
+    return cv2.resize(image[y:y+side, x:x+side], (size, size), interpolation=cv2.INTER_AREA)
+
+def probs(v):
+    v = np.asarray(v, dtype=np.float32).reshape(-1)
+    if np.all(v >= -1e-5) and abs(float(v.sum())-1) < 1e-3:
+        return v / max(float(v.sum()), 1e-12)
+    v -= v.max(); p = np.exp(v); return p / max(float(p.sum()), 1e-12)
+
+class Net:
+    def __init__(self, param, names, size, threads, imagenet, fp16):
+        import ncnn
+        self.ncnn, self.names, self.size, self.imagenet = ncnn, names, size, imagenet
+        self.net = ncnn.Net()
+        self.net.opt.num_threads = threads
+        self.net.opt.use_vulkan_compute = False
+        self.net.opt.use_fp16_packed = bool(fp16)
+        self.net.opt.use_fp16_storage = bool(fp16)
+        self.net.opt.use_packing_layout = True
+        if self.net.load_param(str(param)) != 0 or self.net.load_model(str(Path(param).with_suffix('.bin'))) != 0:
+            raise RuntimeError("模型加载失败: " + str(param))
+    def predict(self, image):
+        rgb = crop(image, self.size)[:, :, ::-1].copy()
+        mat = self.ncnn.Mat.from_pixels(rgb.tobytes(), self.ncnn.Mat.PixelType.PIXEL_RGB, self.size, self.size)
+        if self.imagenet:
+            mat.substract_mean_normalize([.485*255,.456*255,.406*255], [1/(.229*255),1/(.224*255),1/(.225*255)])
+        else:
+            mat.substract_mean_normalize([0,0,0], [1/255,1/255,1/255])
+        ex = self.net.create_extractor(); ex.input("in0", mat)
+        code, out = ex.extract("out0")
+        if code != 0: raise RuntimeError("推理失败")
+        p = probs(out); i = int(p.argmax()); return self.names[i], float(p[i]), p
+
+def inspect(cotton, fiber, image, args):
+    import cv2
+    t = time.perf_counter(); ft_raw, fc, fp = fiber.predict(image)
+    ft = fton(ft_raw)
+    cotton_index = next((i for i, name in enumerate(fiber.names) if name == "棉"), None)
+    cotton_gate_prob = float(fp[cotton_index]) if cotton_index is not None else 0.0
+    cotton_entered = cotton_gate_prob >= args.cotton_gate
+    ct_raw, cc, cp = "未运行", 0.0, np.zeros(3, dtype=np.float32)
+    ct = "不适用"
+    cotton_margin = 0.0
+    if cotton_entered:
+
+// ---------- 第 36 页 ----------
+        ct_raw, cc, cp = cotton.predict(image)
+        ct = cton(ct_raw)
+        order = np.sort(cp)
+        cotton_margin = float(order[-1] - order[-2])
+        if cc < args.cotton_threshold or cotton_margin < args.cotton_margin: ct = "待定"
+    if fc < args.fiber_threshold: ft = "其他"
+    passed = cotton_entered and ((ct == "低棉" and ft == "其他") or (ct == "高棉" and ft == "纯棉"))
+    roi = crop(image, 660, 660)
+    focus = float(cv2.Laplacian(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var())
+    if focus < args.focus_threshold: passed = False
+    return {"cotton_tier":ct, "cotton_raw":ct_raw, "cotton_conf":round(cc,5),
+            "pure_fiber":ft, "pure_fiber_raw":ft_raw, "pure_fiber_conf":round(fc,5),
+            "cross_check":"通过" if passed else "复核", "elapsed_ms":round((time.perf_counter()-t)*1000,1),
+            "focus":round(focus,1), "cotton_margin":round(cotton_margin,5),
+            "cotton_gate_prob":round(cotton_gate_prob,5), "cotton_entered":cotton_entered,
+            "cotton_probs":[round(float(x),5) for x in cp], "fiber_probs":[round(float(x),5) for x in fp]}
+
+def font(size):
+    from PIL import ImageFont
+    for name in FONT_CANDIDATES:
+        if Path(name).is_file():
+            return ImageFont.truetype(name, size)
+    return ImageFont.load_default()
+
+def panel(image, result):
+    import cv2
+    from PIL import Image, ImageDraw
+    h,w=image.shape[:2]; pw=min(500,max(400,w//3)); x0=w-pw
+    cv2.rectangle(image,(x0,0),(w,h),(12,18,26),-1)
+    pil=Image.fromarray(image[:,:,::-1]); d=ImageDraw.Draw(pil); x=x0+24
+    d.text((x,18),'面料智能检测',font=font(30),fill='white'); d.line((x,68,w-24,68),fill=(105,125,145),width=2)
+    y=100
+    for label,value,conf in [('棉含量档位',result['cotton_tier'],result['cotton_conf']),('纯面料判断',result['pure_fiber'],result['pure_fiber_conf'])]:
+        d.text((x,y),label,font=font(21),fill=(220,232,242)); d.text((x,y+30),value,font=font(36),fill='white'); d.text((x,y+78),f'置信度 {conf:.1%}',font=font(18),fill=(225,235,242)); y+=130
+    d.text((x,y-12),f"棉门控 P(棉) {result['cotton_gate_prob']:.1%}",font=font(18),fill=(255,225,90))
+    d.text((x,y+14),'已进入棉含量识别' if result['cotton_entered'] else '未进入棉含量识别',font=font(18),fill=(225,235,242)); y+=48
+    color=(28,145,75) if result['cross_check']=='通过' else (190,105,20)
+    d.text((x,y),'最终判定',font=font(21),fill='white'); d.rounded_rectangle((x,y+32,w-24,y+106),radius=10,fill=color,outline='white',width=2)
+    d.text((x+18,y+42),result['cross_check'],font=font(44),fill='white')
+    d.text((x,y+124),f"推理时间  {result['elapsed_ms']:.0f} ms",font=font(26),fill=(255,225,90))
+    focus_color=(80,220,125) if result['focus']>=75 else (255,175,55)
+    d.text((x,y+164),f"清晰度  {result['focus']:.0f}",font=font(21),fill=focus_color)
+    d.text((x,h-40),'SPACE 识别    Q / ESC 退出',font=font(18),fill=(205,220,232))
+    return np.asarray(pil)[:,:,::-1].copy()
+
+def main():
+    ap = argparse.ArgumentParser()
+    here = Path(__file__).resolve().parent; m = here / "models"
+    ap.add_argument("--cotton-param", default=str(m/"cotton_tier/model.ncnn.param")); ap.add_argument("--fiber-param", default=str(m/"pure_fiber/model.ncnn.param"))
+    ap.add_argument("--image"); ap.add_argument("--dir"); ap.add_argument("--camera", type=int, default=None)
+
+// ---------- 第 37 页 ----------
+    ap.add_argument("--threads", type=int, default=2)
+    ap.add_argument("--width", type=int, default=1280); ap.add_argument("--height", type=int, default=720); ap.add_argument("--mjpg", action="store_true")
+    ap.add_argument("--cotton-threshold", type=float, default=.55); ap.add_argument("--cotton-margin", type=float, default=.10)
+    ap.add_argument("--cotton-gate", type=float, default=.20)
+    ap.add_argument("--fiber-threshold", type=float, default=.50); ap.add_argument("--focus-threshold", type=float, default=75.0)
+    ap.add_argument("--no-fp16", action="store_true"); ap.add_argument("--check", action="store_true")
+    a = ap.parse_args(); fp16 = not a.no_fp16
+    cotton = Net(a.cotton_param, labels(a.cotton_param,COTTON_DEFAULT),384,a.threads,True,fp16)
+    fiber = Net(a.fiber_param, labels(a.fiber_param,FIBER_DEFAULT),288,a.threads,False,fp16)
+    if a.check:
+        print(inspect(cotton,fiber,np.zeros((720,1280,3),np.uint8),a)); return
+    import cv2
+    if a.image or a.dir:
+        files=[a.image] if a.image else sorted(sum([glob.glob(os.path.join(a.dir,e)) for e in ('*.jpg','*.jpeg','*.png','*.bmp')],[]))
+        for p in files:
+            im=cv2.imdecode(np.fromfile(p,np.uint8),cv2.IMREAD_COLOR)
+            print(os.path.basename(p), '->', inspect(cotton,fiber,im,a) if im is not None else '读取失败')
+        return
+    cap=cv2.VideoCapture(a.camera if a.camera is not None else 0)
+    if not cap.isOpened(): raise SystemExit("打不开摄像头")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,a.width); cap.set(cv2.CAP_PROP_FRAME_HEIGHT,a.height)
+    if a.mjpg: cap.set(cv2.CAP_PROP_FOURCC,cv2.VideoWriter_fourcc(*'MJPG'))
+    print("空格识别，q/ESC退出；固定中心660 ROI，默认单帧，不做表决")
+    result=None
+    while True:
+        ok,frame=cap.read()
+        if not ok: break
+        view=frame.copy(); cv2.putText(view,'USB microscope',(10,30),0,.8,(0,255,0),2)
+        h,w=frame.shape[:2]; side=min(h,w,660); x1=(w-side)//2; y1=(h-side)//2
+        cv2.rectangle(view,(x1,y1),(x1+side,y1+side),(0,255,0),2)
+        if result: view=panel(view,result)
+        cv2.imshow('dual fabric inspect 32bit',view); key=cv2.waitKey(1)&255
+        if key in (ord('q'),27): break
+        if key==ord(' '):
+            result=inspect(cotton,fiber,frame,a); print(result)
+    cap.release(); cv2.destroyAllWindows()
+
+if __name__ == '__main__': main()
+
+// ===== packages/32bit/benchmark_dual.py =====
+import argparse
+import time
+from pathlib import Path
+
+import numpy as np
+
+from rpi_dual_inspect import Net, labels, COTTON_DEFAULT, FIBER_DEFAULT, inspect
+
+def main():
+    ap = argparse.ArgumentParser()
+
+// ---------- 第 38 页 ----------
+    ap.add_argument("--threads", type=int, default=2)
+    ap.add_argument("--runs", type=int, default=10)
+    ap.add_argument("--no-fp16", action="store_true")
+    args = ap.parse_args()
+    root = Path(__file__).resolve().parent / "models"
+    fp16 = not args.no_fp16
+    cotton_param = root / "cotton_tier" / "model.ncnn.param"
+    fiber_param = root / "pure_fiber" / "model.ncnn.param"
+    cotton = Net(str(cotton_param), labels(cotton_param, COTTON_DEFAULT),
+                 384, args.threads, True, fp16)
+    fiber = Net(str(fiber_param), labels(fiber_param, FIBER_DEFAULT),
+                288, args.threads, False, fp16)
+    image = np.random.randint(0, 256, (720, 1280, 3), dtype=np.uint8)
+    config = argparse.Namespace(cotton_threshold=0.0, cotton_margin=0.0,
+                                cotton_gate=0.0, fiber_threshold=0.0, focus_threshold=0.0)
+    for _ in range(2):
+        inspect(cotton, fiber, image, config)
+    times = []
+    for _ in range(args.runs):
+        start = time.perf_counter()
+        inspect(cotton, fiber, image, config)
+        times.append(time.perf_counter() - start)
+    print(f"threads={args.threads} fp16={fp16} mean={np.mean(times):.3f}s "
+          f"min={min(times):.3f}s max={max(times):.3f}s fps={1 / np.mean(times):.2f}")
+
+if __name__ == "__main__":
+    main()
+
+// ===== tests/test_config.py =====
+# -*- coding: utf-8 -*-
+import json
+import pytest
+
+from fabric_inspection.config import load_thresholds
+
+def test_defaults():
+    thresholds = load_thresholds()
+    assert thresholds.cotton_gate == 0.20
+    assert thresholds.focus == 75.0
+    assert thresholds.focus_required is False
+
+def test_load_and_override(tmp_path):
+    path = tmp_path / "inspection.json"
+    path.write_text(json.dumps({"cotton_gate": 0.0, "focus_required": True}),
+                    encoding="utf-8")
+    thresholds = load_thresholds(path)
+    assert thresholds.cotton_gate == 0.0
+    assert thresholds.focus_required is True
+    assert thresholds.fiber_confidence == 0.50
+
+
+// ---------- 第 39 页 ----------
+def test_unknown_key_rejected(tmp_path):
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps({"unknown": 1}), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_thresholds(path)
+
+// ===== tests/test_decision.py =====
+# -*- coding: utf-8 -*-
+import numpy as np
+import pytest
+
+from fabric_inspection.decision import Thresholds, decide, softmax
+
+FIBERS = ["丝", "亚麻", "其他", "棉", "涤纶", "羊毛"]
+
+def fiber_with(cotton_probability: float, top_name: str = "棉"):
+    """构造以指定类别为最高分的六类概率。"""
+    probabilities = {name: 0.0 for name in FIBERS}
+    if top_name == "棉":
+        probabilities["棉"] = max(cotton_probability, 0.7)
+        share = (1.0 - probabilities["棉"]) / (len(FIBERS) - 1)
+        for name in FIBERS:
+            if name != "棉":
+                probabilities[name] = share
+    else:
+        probabilities[top_name] = 0.7
+        probabilities["棉"] = cotton_probability
+        rest = [name for name in FIBERS if name not in (top_name, "棉")]
+        share = (1.0 - 0.7 - cotton_probability) / max(1, len(rest))
+        for name in rest:
+            probabilities[name] = share
+    return [probabilities[name] for name in FIBERS]
+
+def test_softmax_stable():
+    result = softmax([1000, 1000, 1000])
+    assert abs(float(result.sum()) - 1.0) < 1e-6
+    assert np.allclose(result, [1 / 3] * 3)
+
+def test_softmax_accepts_probabilities():
+    result = softmax([0.2, 0.3, 0.5])
+    assert float(result.sum()) == pytest.approx(1.0)
+
+def test_gate_skips_cotton_model():
+    result = decide(None, fiber_with(0.05, "涤纶"), FIBERS, Thresholds())
+    assert result.cotton_entered is False
+    assert result.cotton_tier == "不适用"
+    assert result.pure_fiber == "纯涤纶"
+    assert result.cross_check == "复核"
+
+def test_low_cotton_and_other_passes():
+
+// ---------- 第 40 页 ----------
+    result = decide([0.9, 0.05, 0.05], fiber_with(0.3, "其他"), FIBERS, Thresholds())
+    assert result.cotton_tier == "低棉"
+    assert result.pure_fiber == "其他"
+    assert result.cross_check == "通过"
+
+def test_high_cotton_and_cotton_passes():
+    result = decide([0.05, 0.05, 0.9], fiber_with(0.8, "棉"), FIBERS, Thresholds())
+    assert result.cotton_tier == "高棉"
+    assert result.pure_fiber == "纯棉"
+    assert result.cross_check == "通过"
+
+def test_mid_cotton_is_reviewed():
+    result = decide([0.05, 0.9, 0.05], fiber_with(0.8, "棉"), FIBERS, Thresholds())
+    assert result.cotton_tier == "中棉"
+    assert result.cross_check == "复核"
+
+def test_low_confidence_becomes_pending():
+    result = decide([0.36, 0.34, 0.30], fiber_with(0.8, "棉"), FIBERS,
+                    Thresholds(cotton_confidence=0.46))
+    assert result.cotton_tier == "待定"
+    assert result.cross_check == "复核"
+
+def test_margin_rule():
+    result = decide([0.40, 0.38, 0.22], fiber_with(0.8, "棉"), FIBERS,
+                    Thresholds(cotton_confidence=0.30, cotton_margin=0.10))
+    assert result.cotton_tier == "待定"
+
+def test_low_fiber_confidence_becomes_other():
+    probabilities = [0.30, 0.20, 0.20, 0.20, 0.05, 0.05]
+    result = decide([0.9, 0.05, 0.05], probabilities, FIBERS, Thresholds())
+    assert result.pure_fiber == "其他"
+
+def test_focus_requirement_blocks_pass():
+    result = decide([0.9, 0.05, 0.05], fiber_with(0.3, "其他"), FIBERS,
+                    Thresholds(focus_required=True, focus=75), focus=10)
+    assert result.cross_check == "复核"
+
+def test_missing_cotton_probs_raises():
+    with pytest.raises(ValueError):
+        decide(None, fiber_with(0.9, "棉"), FIBERS, Thresholds())
+
+// ===== tests/test_labels.py =====
+# -*- coding: utf-8 -*-
+from fabric_inspection.labels import cotton_business, cotton_index, fiber_business
+
+def test_cotton_business_aliases():
+    assert cotton_business("Tier0_Low") == "低棉"
+    assert cotton_business("Tier1_Mid") == "中棉"
+    assert cotton_business("Tier2_High") == "高棉"
+    assert cotton_business("未知") == "其他"
+
+// ---------- 第 41 页 ----------
+
+def test_fiber_business_mapping():
+    assert fiber_business("棉") == "纯棉"
+    assert fiber_business("羊毛") == "纯羊毛"
+    assert fiber_business("涤纶") == "纯涤纶"
+    assert fiber_business("丝") == "其他"
+    assert fiber_business("亚麻") == "其他"
+
+def test_cotton_index():
+    names = ["丝", "亚麻", "其他", "棉", "涤纶", "羊毛"]
+    assert cotton_index(names) == 3
+    assert cotton_index(["棉", "涤纶"]) == 0
+    assert cotton_index(["丝"]) is None
+
+// ===== tests/test_metrics.py =====
+# -*- coding: utf-8 -*-
+import numpy as np
+import pytest
+
+from fabric_inspection.metrics import (
+    confusion_matrix, group_vote_accuracy, majority_vote, per_class_recall,
+    top1_accuracy,
+)
+
+LABELS = ["低棉", "中棉", "高棉"]
+
+def test_confusion_matrix_and_accuracy():
+    matrix = confusion_matrix(["低棉", "低棉", "高棉"], ["低棉", "中棉", "高棉"], LABELS)
+    assert matrix.tolist() == [[1, 1, 0], [0, 0, 0], [0, 0, 1]]
+    assert top1_accuracy(matrix) == pytest.approx(2 / 3)
+
+def test_per_class_recall():
+    matrix = np.array([[2, 0, 0], [1, 1, 0], [0, 0, 3]])
+    assert per_class_recall(matrix) == pytest.approx([1.0, 0.5, 1.0])
+
+def test_group_vote():
+    groups = {
+        "a": [np.array([0.6, 0.3, 0.1]), np.array([0.7, 0.2, 0.1])],
+        "b": [np.array([0.1, 0.2, 0.7])],
+    }
+    truth = {"a": "低棉", "b": "高棉"}
+    assert group_vote_accuracy(groups, truth, LABELS) == 1.0
+
+def test_group_vote_partial():
+    groups = {
+        "a": [np.array([0.4, 0.35, 0.25])],
+        "b": [np.array([0.1, 0.2, 0.7])],
+    }
+    truth = {"a": "高棉", "b": "高棉"}
+    assert group_vote_accuracy(groups, truth, LABELS) == 0.5
+
+// ---------- 第 42 页 ----------
+
+def test_majority_vote_tie_keeps_first():
+    assert majority_vote(["低棉", "高棉"]) == "低棉"
+    assert majority_vote(["高棉", "低棉", "高棉"]) == "高棉"
+
+def test_empty_vote_raises():
+    with pytest.raises(ValueError):
+        majority_vote([])
+
+// ===== tests/test_preprocess.py =====
+# -*- coding: utf-8 -*-
+import numpy as np
+import pytest
+
+from fabric_inspection.preprocess import (
+    center_square, focus_score, imagenet_normalize, resize_square, to_float_rgb,
+)
+
+def test_center_square_uses_short_side():
+    image = np.zeros((720, 1280, 3), dtype=np.uint8)
+    crop = center_square(image)
+    assert crop.shape == (720, 720, 3)
+
+def test_center_square_respects_side():
+    image = np.zeros((720, 1280, 3), dtype=np.uint8)
+    crop = center_square(image, 660)
+    assert crop.shape == (660, 660, 3)
+
+def test_center_square_rejects_invalid():
+    with pytest.raises(ValueError):
+        center_square(np.zeros((0, 10, 3), dtype=np.uint8))
+
+def test_resize_square():
+    image = np.zeros((100, 200, 3), dtype=np.uint8)
+    assert resize_square(image, 32).shape == (32, 32, 3)
+
+def test_rgb_and_normalize_range():
+    image = np.full((8, 8, 3), 255, dtype=np.uint8)
+    rgb = to_float_rgb(image)
+    assert rgb.shape == (8, 8, 3)
+    assert rgb.min() >= 0.0 and rgb.max() <= 1.0
+    normalized = imagenet_normalize(rgb)
+    assert normalized.shape == (8, 8, 3)
+    assert normalized.dtype == np.float32
+
+def test_focus_score_sharp_vs_flat():
+    flat = np.full((64, 64, 3), 128, dtype=np.uint8)
+    checker = (np.indices((64, 64)).sum(axis=0) % 2 * 255).astype(np.uint8)
+    checker = np.repeat(checker[:, :, None], 3, axis=2)
+    assert focus_score(flat) == 0.0
+
+// ---------- 第 43 页 ----------
+    assert focus_score(checker) > 1000
+
+// ===== tests/test_records.py =====
+# -*- coding: utf-8 -*-
+import csv
+
+import pytest
+
+from fabric_inspection.decision import decide, Thresholds
+from fabric_inspection.records import CSV_HEADER, RecordWriter
+
+FIBERS = ["丝", "亚麻", "其他", "棉", "涤纶", "羊毛"]
+
+def make_result():
+    fiber = [0.02, 0.02, 0.06, 0.80, 0.05, 0.05]
+    cotton = [0.05, 0.05, 0.90]
+    return decide(cotton, fiber, FIBERS, Thresholds())
+
+def test_header_and_first_row(tmp_path):
+    writer = RecordWriter(tmp_path / "records")
+    saved = writer.save(make_result(), image_bytes=b"jpeg")
+    assert saved["sample_id"] == 1
+    assert saved["image"].startswith("Sample001_")
+    with (tmp_path / "records" / "inspection_report.csv").open(
+            newline="", encoding="utf-8-sig") as stream:
+        rows = list(csv.DictReader(stream))
+    assert rows[0]["样品编号"] == "Sample-001"
+    assert rows[0]["棉含量档位"] == "高棉"
+    assert rows[0]["交叉结论"] == "通过"
+
+def test_numbering_continues(tmp_path):
+    folder = tmp_path / "records"
+    RecordWriter(folder).save(make_result())
+    writer = RecordWriter(folder)
+    saved = writer.save(make_result())
+    assert saved["sample_id"] == 2
+
+def test_incompatible_header_rejected(tmp_path):
+    folder = tmp_path / "records"
+    folder.mkdir()
+    (folder / "inspection_report.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    with pytest.raises(RuntimeError):
+        RecordWriter(folder)
+
+def test_failed_write_rolls_back(tmp_path, monkeypatch):
+    folder = tmp_path / "records"
+    writer = RecordWriter(folder)
+    original = writer.report.open
+
+    def broken(*args, **kwargs):
+
+// ---------- 第 44 页 ----------
+        raise OSError("disk full")
+
+    monkeypatch.setattr(writer.report.__class__, "open", broken, raising=False)
+    with pytest.raises(OSError):
+        writer.save(make_result(), image_bytes=b"jpeg")
+    assert not list(folder.glob("*.jpg"))
+
+// ===== tools/verify_models.py =====
+# -*- coding: utf-8 -*-
+"""校验 NCNN 模型、标签和清单哈希是否一致。
+
+不依赖 ncnn 运行时，只解析 .param 文本，适合 CI 或交付前检查。
+"""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def parse_param(path: Path) -> dict:
+    """提取输入/输出节点和最后一层分类数。"""
+    lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()
+             if line.strip()]
+    has_input = any(line.split()[0] == "Input" and " in0" in line for line in lines)
+    has_output = any(" out0" in line for line in lines)
+    classes = None
+    for line in lines:
+        fields = line.split()
+        if len(fields) > 5 and fields[0] == "InnerProduct":
+            for token in fields[5:]:
+                if token.startswith("0="):
+                    try:
+                        classes = int(token.split("=", 1)[1])
+                    except ValueError:
+                        pass
+    return {"input_in0": has_input, "output_out0": has_output, "classes": classes}
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--manifest", type=Path, default=ROOT / "models" / "manifest.json")
+    args = ap.parse_args()
+
+
+// ---------- 第 45 页 ----------
+    manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+    failures = []
+    for name, item in manifest["models"].items():
+        param = ROOT / item["param"]
+        binary = ROOT / item["bin"]
+        print(f"[{name}]")
+        for path, key in ((param, "param_sha256"), (binary, "bin_sha256")):
+            if not path.is_file():
+                failures.append(f"缺少文件: {path}")
+                continue
+            actual = sha256(path)
+            ok = actual == item[key]
+            print(f"  {path.name}: {'OK' if ok else 'HASH MISMATCH'}")
+            if not ok:
+                failures.append(f"{path} 哈希不一致")
+        if param.is_file():
+            info = parse_param(param)
+            print(f"  in0={info['input_in0']} out0={info['output_out0']} classes={info['classes']}")
+            if not info["input_in0"] or not info["output_out0"]:
+                failures.append(f"{param} 缺少 in0/out0")
+            if info["classes"] != len(item["labels"]):
+                failures.append(f"{param} 输出类别数与 labels 不一致")
+            labels = json.loads((param.parent / "labels.json").read_text(encoding="utf-8"))
+            if labels != item["labels"]:
+                failures.append(f"{param.parent}/labels.json 与清单不一致")
+        if binary.is_file() and binary.stat().st_size != item["bin_bytes"]:
+            failures.append(f"{binary} 大小不一致")
+
+    if failures:
+        print("\n校验失败:")
+        for failure in failures:
+            print(" -", failure)
+        raise SystemExit(1)
+    print("\n全部校验通过")
+
+if __name__ == "__main__":
+    main()
+
+
