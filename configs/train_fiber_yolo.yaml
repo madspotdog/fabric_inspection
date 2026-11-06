@@ -1,0 +1,68 @@
+# 纯面料六分类训练配方（YOLOv8n-cls）
+#
+# 该文件是训练参数记录，供复现和审计使用。
+# 实际执行命令示例：
+#   python scripts/train_dual_yolo.py \
+#     --data ../dual_data --project training_runs_yolo \
+#     --fiber-imgsz 288 --epochs 50 --batch 32 --skip-cotton \
+#     --fiber-model weights/fiber5_yolov8n_cls_288.pt \
+#     --fiber-data ../dual_data/pure_fiber6 --fiber-name pure_fiber6_round2
+
+experiment: pure_fiber6_rot90
+task: classify
+model: yolov8n-cls.pt
+pretrained: true
+input_size: 288
+num_classes: 6
+classes:
+  - 丝
+  - 亚麻
+  - 其他
+  - 棉
+  - 涤纶
+  - 羊毛
+
+data:
+  root: ../dual_data/pure_fiber6
+  train: train
+  val: val
+  blind: blind
+  split_by: fabric_id
+  exclude_duplicates: true
+
+train:
+  epochs: 50
+  batch: 32
+  optimizer: auto
+  lr0: 0.01
+  seed: 42
+  deterministic: true
+  workers: 0
+
+augmentation:
+  degrees: 90
+  fliplr: 0.5
+  flipud: 0.5
+  scale: 0.35
+  translate: 0.08
+  hsv_h: 0.015
+  hsv_s: 0.35
+  hsv_v: 0.25
+  erasing: 0.2
+  auto_augment: randaugment
+
+normalization:
+  mode: zero_to_one
+  mean: [0, 0, 0]
+  std: [1, 1, 1]
+
+deployment:
+  format: ncnn
+  input_node: in0
+  output_node: out0
+  fp16: true
+  production_tta: false
+
+license_note: >
+  YOLOv8 属于 Ultralytics，许可证为 AGPL-3.0。
+  商业分发前需购买商业许可或按 AGPL 开源，详见 THIRD_PARTY.md。

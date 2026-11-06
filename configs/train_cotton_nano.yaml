@@ -1,0 +1,69 @@
+# 棉含量三分类训练配方（ConvNeXt-Nano）
+#
+# 该文件是训练参数记录，供复现和审计使用。
+# 实际执行命令示例：
+#   python scripts/train_kd_3tier.py \
+#     --student convnext_nano.in12k_ft_in1k --imgsz 384 --epochs 6 \
+#     --batch 16 --lr 3e-5 --data ../dual_data/cotton_tier \
+#     --testdir ../dual_data/cotton_tier/blind \
+#     --init weights/nano_rot90_best_test.pt --workers 0
+
+experiment: cotton_nano_rot90
+task: classification
+model: convnext_nano.in12k_ft_in1k
+pretrained: true
+input_size: 384
+num_classes: 3
+classes:
+  - Tier0_Low
+  - Tier1_Mid
+  - Tier2_High
+
+data:
+  root: ../dual_data/cotton_tier
+  train: train
+  val: val
+  blind: blind
+  split_by: fabric_id
+  train_repeat_real: 8
+
+train:
+  epochs: 6
+  batch: 16
+  optimizer: AdamW
+  lr: 3.0e-5
+  weight_decay: 0.02
+  scheduler: cosine
+  eta_min: 1.0e-6
+  label_smoothing: 0.05
+  workers: 0
+  amp: true
+
+distillation:
+  enabled: true
+  teacher: convnext_small.fb_in22k_ft_in1k_384
+  teacher_weight: null   # 未随仓库分发；缺失时自动退化为 CE
+  temperature: 4.0
+  alpha: 0.3             # CE 权重，(1-alpha) 为 KD
+
+augmentation:
+  resize_ratio: 1.04
+  random_resized_crop:
+    scale: [0.6, 1.0]
+    ratio: [0.9, 1.1]
+  orthogonal_rotation: [0, 90, 180, 270]
+  horizontal_flip: 0.5
+  vertical_flip: 0.5
+  grayscale: 0.2
+  color_jitter:
+    brightness: 0.15
+    contrast: 0.15
+
+normalization:
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+
+evaluation:
+  metrics: [top1, per_class_recall, fabric_vote]
+  tta: [0, 90, 180, 270]
+  production_tta: false

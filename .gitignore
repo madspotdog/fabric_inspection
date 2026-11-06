@@ -1,8 +1,7 @@
-__pycache__/
+﻿__pycache__/
 *.pyc
 *.log
 .venv/
-weights/*.pt
 archives/*.zip
 training_runs/
 training_runs_yolo/
